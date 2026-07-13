@@ -1,15 +1,18 @@
 # Cloudflare Workers MCP Server
 
+[![npm version](https://img.shields.io/npm/v/cloudflare-workers-mcp.svg)](https://www.npmjs.com/package/cloudflare-workers-mcp)
+[![Tests](https://github.com/daniil-shumko/cloudflare-workers-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/daniil-shumko/cloudflare-workers-mcp/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-Compatible-blue)](https://modelcontextprotocol.io)
 
 > ⚠️ **Security warning**: this server was substantially AI-written. Before
 > pointing it at an account you care about: (1) review the code — it is small
-> and readable, an audit takes ~30 minutes; (2) clone and build from source
-> rather than trusting a published artifact (it is deliberately not on npm);
-> (3) give the API token the minimum permission (**Workers Scripts: Edit**)
-> and nothing else; (4) prefer a test account for the first runs.
+> and readable, an audit takes ~30 minutes; (2) for maximum caution, clone and
+> build from source rather than trusting the npm artifact (or at least pin an
+> exact version); (3) give the API token the minimum permission
+> (**Workers Scripts: Edit**) and nothing else; (4) prefer a test account for
+> the first runs.
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for
 managing Cloudflare Workers from Claude Desktop or Claude Code — the successor
@@ -60,8 +63,14 @@ so this server's headline feature is:
 
 ## Quick Start
 
-Requires **Node.js 22+**. Not published to npm — build from source:
+Requires **Node.js 22+**.
 
+**Option A: install from npm**
+```bash
+npm install -g cloudflare-workers-mcp
+```
+
+**Option B: clone and build locally (for code review)**
 ```bash
 git clone https://github.com/daniil-shumko/cloudflare-workers-mcp
 cd cloudflare-workers-mcp
@@ -80,8 +89,8 @@ your account ID in the [dashboard](https://dash.cloudflare.com), then:
 {
   "mcpServers": {
     "cloudflare-workers": {
-      "command": "node",
-      "args": ["/absolute/path/to/cloudflare-workers-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["cloudflare-workers-mcp"],
       "env": {
         "CLOUDFLARE_API_TOKEN": "your_token_here",
         "CLOUDFLARE_ACCOUNT_ID": "your_account_id_here"
@@ -91,13 +100,16 @@ your account ID in the [dashboard](https://dash.cloudflare.com), then:
 }
 ```
 
+(If you built from source, use `"command": "node"` with
+`"args": ["/absolute/path/to/cloudflare-workers-mcp/dist/index.js"]` instead.)
+
 Or with the Claude Code CLI:
 
 ```bash
 claude mcp add cloudflare-workers \
   -e CLOUDFLARE_API_TOKEN=your_token_here \
   -e CLOUDFLARE_ACCOUNT_ID=your_account_id_here \
-  -- node /absolute/path/to/cloudflare-workers-mcp/dist/index.js
+  -- npx cloudflare-workers-mcp
 ```
 
 ## Usage Examples
