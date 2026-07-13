@@ -20,7 +20,11 @@ const EXPECTED_TOOLS = [
   "create_deployment",
   "rollback_worker",
   "get_cron_triggers",
+  "set_cron_triggers",
   "list_worker_domains",
+  "add_worker_domain",
+  "delete_worker_domain",
+  "set_workers_dev",
   "health_check",
 ].sort();
 

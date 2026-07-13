@@ -271,6 +271,36 @@ const UpdateWorkerSettingsSchema = z.object({
     .describe("Workers Logs configuration"),
 });
 
+const AddWorkerDomainSchema = z.object({
+  hostname: z
+    .string()
+    .describe("Hostname to attach, e.g. app.example.com (zone apex or subdomain)"),
+  service: z.string().describe("The Worker (script name) to route the hostname to"),
+  environment: z.string().optional().describe("Worker environment (default: production)"),
+  zone_id: z.string().optional().describe("Zone ID (the zone must be active in this account)"),
+  zone_name: z.string().optional().describe("Zone name, e.g. example.com"),
+});
+
+const DeleteWorkerDomainSchema = z.object({
+  domain_id: z.string().describe("Domain attachment ID (from list_worker_domains)"),
+});
+
+const SetWorkersDevSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  enabled: z.boolean().describe("Serve the Worker at <script_name>.<account>.workers.dev"),
+  previews_enabled: z
+    .boolean()
+    .optional()
+    .describe("Also serve preview URLs for uploaded versions"),
+});
+
+const SetCronTriggersSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  crons: z
+    .array(z.string().describe("Cron expression, e.g. */30 * * * *"))
+    .describe("REPLACES the Worker's full cron trigger set; pass [] to remove all triggers"),
+});
+
 const HealthCheckSchema = z.object({});
 
 /** Today as YYYY-MM-DD — the default compatibility_date for new uploads. */
@@ -895,6 +925,104 @@ async function main() {
       const response = await workers.listDomains(input);
       const domains = (response.result ?? []).map(summarizeDomain);
       return ok({ domains }, `Found ${domains.length} custom domain(s)`);
+    }
+  );
+
+  addTool(
+    "add_worker_domain",
+    {
+      title: "Add Worker Domain",
+      description:
+        "Attach a custom domain to a Worker. The domain's zone must be active in this Cloudflare account (external zones are not supported); Cloudflare creates the DNS record and certificate automatically.",
+      inputSchema: AddWorkerDomainSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.attachDomain(input);
+      return ok(
+        { domain: summarizeDomain(response.result) },
+        `Attached ${input.hostname} to ${input.service} — DNS and TLS may take a few minutes to propagate`
+      );
+    }
+  );
+
+  addTool(
+    "delete_worker_domain",
+    {
+      title: "Delete Worker Domain",
+      description:
+        "Detach a custom domain from its Worker. The hostname stops routing to the Worker (and its previews).",
+      inputSchema: DeleteWorkerDomainSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      await workers.detachDomain(input.domain_id);
+      return ok(
+        { domain_id: input.domain_id, deleted: true },
+        `Detached domain ${input.domain_id}`
+      );
+    }
+  );
+
+  addTool(
+    "set_workers_dev",
+    {
+      title: "Set workers.dev Serving",
+      description:
+        "Enable or disable serving a Worker on its <script_name>.<account>.workers.dev subdomain, and optionally version preview URLs.",
+      inputSchema: SetWorkersDevSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.setScriptSubdomain(
+        input.script_name,
+        input.enabled,
+        input.previews_enabled
+      );
+
+      let url: string | undefined;
+      if (response.result?.enabled) {
+        try {
+          const account = await workers.getAccountSubdomain();
+          const sub = account.result?.subdomain;
+          if (sub) url = `https://${input.script_name}.${sub}.workers.dev`;
+        } catch {
+          // URL is a convenience; the setting itself succeeded.
+        }
+      }
+
+      return ok(
+        {
+          script_name: input.script_name,
+          enabled: response.result?.enabled,
+          previews_enabled: response.result?.previews_enabled,
+          url,
+        },
+        input.enabled
+          ? `workers.dev enabled${url ? ` — ${url}` : ""}`
+          : `workers.dev disabled for ${input.script_name}`
+      );
+    }
+  );
+
+  addTool(
+    "set_cron_triggers",
+    {
+      title: "Set Cron Triggers",
+      description:
+        "Replace a Worker's full cron trigger set (the Worker must export a scheduled handler). Pass an empty list to remove all triggers.",
+      inputSchema: SetCronTriggersSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.setCronTriggers(input.script_name, input.crons);
+      const schedules = response.result?.schedules ?? [];
+      return ok(
+        { script_name: input.script_name, schedules },
+        schedules.length === 0
+          ? `Removed all cron triggers from ${input.script_name}`
+          : `Set ${schedules.length} cron trigger(s) on ${input.script_name}`
+      );
     }
   );
 

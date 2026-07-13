@@ -478,6 +478,45 @@ export class WorkersClient {
     );
   }
 
+  /**
+   * Replace a Worker's full cron trigger set. The PUT body is a bare JSON
+   * array of {cron} objects; the {schedules: [...]} wrapper only appears in
+   * responses. An empty array clears all triggers.
+   */
+  async setCronTriggers(
+    scriptName: string,
+    crons: string[]
+  ): Promise<CloudflareResponse<CronTriggerList>> {
+    return this.request<CronTriggerList>(
+      "PUT",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/schedules`,
+      crons.map((cron) => ({ cron }))
+    );
+  }
+
+  /** Attach a custom domain to a Worker. The zone must be active in this account. */
+  async attachDomain(body: {
+    hostname: string;
+    service: string;
+    environment?: string;
+    zone_id?: string;
+    zone_name?: string;
+  }): Promise<CloudflareResponse<WorkerDomain>> {
+    return this.request<WorkerDomain>(
+      "PUT",
+      `/accounts/${this.accountId}/workers/domains`,
+      body
+    );
+  }
+
+  /** Detach a custom domain from its Worker. */
+  async detachDomain(domainId: string): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      `/accounts/${this.accountId}/workers/domains/${encodeURIComponent(domainId)}`
+    );
+  }
+
   async getScriptSubdomain(
     scriptName: string
   ): Promise<CloudflareResponse<ScriptSubdomain>> {

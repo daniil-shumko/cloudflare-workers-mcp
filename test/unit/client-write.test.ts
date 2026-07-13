@@ -159,6 +159,47 @@ test("getVersion targets the version-detail endpoint", async () => {
   }
 });
 
+test("setCronTriggers PUTs a bare JSON array and parses the schedules wrapper", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ schedules: [{ cron: "*/30 * * * *" }] }));
+
+    const client = makeClient();
+    const response = await client.setCronTriggers("cron-worker", ["*/30 * * * *"]);
+
+    assert.equal(mock.calls[0].method, "PUT");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/cron-worker/schedules`);
+    // The request body must be the bare array — the {schedules} wrapper is response-only.
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), [{ cron: "*/30 * * * *" }]);
+    assert.equal(response.result.schedules?.[0].cron, "*/30 * * * *");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("attachDomain PUTs to /workers/domains and detachDomain DELETEs by ID", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "dom-1", hostname: "app.example.com", service: "my-worker" }));
+    mock.enqueue(cfOk(null));
+
+    const client = makeClient();
+    await client.attachDomain({ hostname: "app.example.com", service: "my-worker" });
+    await client.detachDomain("dom-1");
+
+    assert.equal(mock.calls[0].method, "PUT");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/domains`);
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), {
+      hostname: "app.example.com",
+      service: "my-worker",
+    });
+    assert.equal(mock.calls[1].method, "DELETE");
+    assert.equal(mock.calls[1].url, `${BASE}/workers/domains/dom-1`);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("setScriptSubdomain POSTs enabled (and previews only when specified)", async () => {
   const mock = installMockFetch();
   try {
