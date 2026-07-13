@@ -8,6 +8,8 @@ const EXPECTED_TOOLS = [
   "list_workers",
   "get_worker",
   "get_worker_code",
+  "deploy_static_site",
+  "redeploy_assets",
   "list_versions",
   "list_deployments",
   "get_cron_triggers",

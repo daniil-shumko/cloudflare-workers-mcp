@@ -6,6 +6,9 @@
 import { TokenBucketRateLimiter } from "../utils/rate-limiter.js";
 import type {
   AccountSubdomain,
+  AssetManifest,
+  AssetUploadResponse,
+  AssetUploadSession,
   CloudflareResponse,
   CronTriggerList,
   ScriptSubdomain,
@@ -63,12 +66,17 @@ export class WorkersClient {
    * the Content-Type header is left for `fetch` to set (so the multipart
    * boundary is generated correctly). Any other non-undefined body is sent as
    * JSON.
+   *
+   * `opts.bearer` overrides the account API token for the one endpoint that
+   * authenticates with an upload-session JWT instead; `opts.timeoutMs` extends
+   * the default 30 s bound for large multipart uploads.
    */
   private async request<T>(
     method: string,
     endpoint: string,
     body?: unknown,
-    queryParams?: Record<string, string | number | boolean | undefined>
+    queryParams?: Record<string, string | number | boolean | undefined>,
+    opts?: { bearer?: string; timeoutMs?: number }
   ): Promise<CloudflareResponse<T>> {
     await this.rateLimiter.acquire();
 
@@ -83,14 +91,15 @@ export class WorkersClient {
 
     const isForm = typeof FormData !== "undefined" && body instanceof FormData;
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiToken}`,
+      Authorization: `Bearer ${opts?.bearer ?? this.apiToken}`,
     };
     if (body !== undefined && !isForm) {
       headers["Content-Type"] = "application/json";
     }
 
+    const timeoutMs = opts?.timeoutMs ?? 30000;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     let response: Response;
     let text: string;
@@ -112,7 +121,7 @@ export class WorkersClient {
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         throw new CloudflareAPIError(
-          [{ code: 0, message: "Request timed out after 30 seconds" }],
+          [{ code: 0, message: `Request timed out after ${Math.round(timeoutMs / 1000)} seconds` }],
           408
         );
       }
@@ -270,6 +279,85 @@ export class WorkersClient {
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  // ==================== Uploads & Lifecycle ====================
+
+  /**
+   * Start an asset upload session for a script: send the manifest, get back a
+   * session JWT and the buckets of hashes Cloudflare doesn't already have.
+   */
+  async createAssetUploadSession(
+    scriptName: string,
+    manifest: AssetManifest
+  ): Promise<CloudflareResponse<AssetUploadSession>> {
+    return this.request<AssetUploadSession>(
+      "POST",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/assets-upload-session`,
+      { manifest }
+    );
+  }
+
+  /**
+   * Upload one bucket of base64-encoded asset files. Authenticates with the
+   * upload-session JWT, not the account API token. The response that completes
+   * the manifest (HTTP 201) carries the completion JWT in `result.jwt`.
+   */
+  async uploadAssetBucket(
+    sessionJwt: string,
+    form: FormData
+  ): Promise<CloudflareResponse<AssetUploadResponse>> {
+    return this.request<AssetUploadResponse>(
+      "POST",
+      `/accounts/${this.accountId}/workers/assets/upload`,
+      form,
+      { base64: true },
+      { bearer: sessionJwt, timeoutMs: 120000 }
+    );
+  }
+
+  /**
+   * Upload (deploy) a script: multipart form with a `metadata` JSON part plus
+   * zero or more module parts. Callers build the FormData (see assets.ts and
+   * the deploy tools); an assets-only Worker sends metadata with no modules.
+   */
+  async uploadScript(
+    scriptName: string,
+    form: FormData
+  ): Promise<CloudflareResponse<WorkerScript>> {
+    return this.request<WorkerScript>(
+      "PUT",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
+      form,
+      undefined,
+      { timeoutMs: 120000 }
+    );
+  }
+
+  /** Delete a Worker script. `force` breaks dependencies (e.g. routes). */
+  async deleteWorker(
+    scriptName: string,
+    force?: boolean
+  ): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
+      undefined,
+      force ? { force: true } : undefined
+    );
+  }
+
+  /** Enable/disable serving a script on workers.dev. */
+  async setScriptSubdomain(
+    scriptName: string,
+    enabled: boolean,
+    previewsEnabled?: boolean
+  ): Promise<CloudflareResponse<ScriptSubdomain>> {
+    return this.request<ScriptSubdomain>(
+      "POST",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`,
+      previewsEnabled === undefined ? { enabled } : { enabled, previews_enabled: previewsEnabled }
+    );
   }
 
   // ==================== Versions & Deployments ====================

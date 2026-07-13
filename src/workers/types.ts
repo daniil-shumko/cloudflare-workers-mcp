@@ -144,3 +144,51 @@ export interface ScriptSubdomain {
 export interface AccountSubdomain {
   subdomain?: string;
 }
+
+/** Asset manifest sent to .../assets-upload-session: root-relative path → hash + size. */
+export type AssetManifest = Record<string, { hash: string; size: number }>;
+
+/**
+ * Result of POST .../assets-upload-session. `buckets` groups the hashes the
+ * server does not already have; when it is empty, `jwt` is already the
+ * completion token.
+ */
+export interface AssetUploadSession {
+  jwt?: string;
+  buckets?: string[][];
+}
+
+/** Result of a bucket upload: `jwt` present (HTTP 201) once the manifest is complete. */
+export interface AssetUploadResponse {
+  jwt?: string;
+}
+
+/** Static-asset serving config (metadata.assets.config on script upload). */
+export interface AssetsConfig {
+  html_handling?: "auto-trailing-slash" | "force-trailing-slash" | "drop-trailing-slash" | "none";
+  not_found_handling?: "none" | "404-page" | "single-page-application";
+  run_worker_first?: boolean | string[];
+  /** Contents of a `_headers` file (not the file path). */
+  _headers?: string;
+  /** Contents of a `_redirects` file (not the file path). */
+  _redirects?: string;
+}
+
+/**
+ * The `metadata` part of a script/version multipart upload. Only the fields
+ * this server sends are typed; the API accepts more (IMPLEMENTATION_PLAN.md §3).
+ */
+export interface ScriptUploadMetadata {
+  main_module?: string;
+  bindings?: Array<Record<string, unknown>>;
+  compatibility_date?: string;
+  compatibility_flags?: string[];
+  assets?: { jwt?: string; config?: AssetsConfig };
+  keep_assets?: boolean;
+  migrations?: Record<string, unknown>;
+  logpush?: boolean;
+  tail_consumers?: Array<{ service: string; environment?: string; namespace?: string }>;
+  placement?: { mode?: string };
+  observability?: { enabled: boolean; head_sampling_rate?: number };
+  annotations?: { "workers/message"?: string; "workers/tag"?: string };
+}

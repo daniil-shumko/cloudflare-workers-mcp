@@ -19,13 +19,14 @@ import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/
 import { z } from "zod";
 
 import { WorkersClient } from "./workers/client.js";
+import { collectAssets, uploadAssets } from "./workers/assets.js";
 import {
   summarizeDeployment,
   summarizeDomain,
   summarizeVersion,
   summarizeWorker,
 } from "./workers/summarize.js";
-import type { WorkerVersion } from "./workers/types.js";
+import type { AssetsConfig, ScriptUploadMetadata, WorkerVersion } from "./workers/types.js";
 import { loadConfig } from "./utils/config.js";
 import { formatError, formatSuccess } from "./utils/errors.js";
 
@@ -72,7 +73,67 @@ const ListWorkerDomainsSchema = z.object({
   environment: z.string().optional().describe("Filter by environment"),
 });
 
+const HtmlHandlingSchema = z
+  .enum(["auto-trailing-slash", "force-trailing-slash", "drop-trailing-slash", "none"])
+  .optional()
+  .describe("How HTML URLs are canonicalized (default: auto-trailing-slash)");
+
+const NotFoundHandlingSchema = z
+  .enum(["none", "404-page", "single-page-application"])
+  .optional()
+  .describe(
+    "Response when no asset matches: 'single-page-application' serves /index.html (SPA mode), '404-page' serves /404.html (default: none)"
+  );
+
+const DeployStaticSiteSchema = z.object({
+  script_name: z
+    .string()
+    .describe("Worker name to deploy the site as (lowercase, alphanumeric and hyphens)"),
+  directory: z
+    .string()
+    .describe("Path to the built site directory to upload (absolute path recommended)"),
+  html_handling: HtmlHandlingSchema,
+  not_found_handling: NotFoundHandlingSchema,
+  compatibility_date: z
+    .string()
+    .optional()
+    .describe("Worker compatibility date (YYYY-MM-DD); defaults to today"),
+  enable_workers_dev: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("Serve the site at <script_name>.<account>.workers.dev after deploying (default true)"),
+});
+
+const RedeployAssetsSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  html_handling: HtmlHandlingSchema,
+  not_found_handling: NotFoundHandlingSchema,
+  compatibility_date: z
+    .string()
+    .optional()
+    .describe("Worker compatibility date (YYYY-MM-DD); defaults to today"),
+});
+
 const HealthCheckSchema = z.object({});
+
+/** Today as YYYY-MM-DD — the default compatibility_date for new uploads. */
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Build the multipart body for a script upload: a `metadata` JSON part plus
+ * one part per module (none for an assets-only Worker).
+ */
+function scriptUploadForm(metadata: ScriptUploadMetadata): FormData {
+  const form = new FormData();
+  form.append(
+    "metadata",
+    new File([JSON.stringify(metadata)], "metadata.json", { type: "application/json" })
+  );
+  return form;
+}
 
 // ==================== Result Helpers ====================
 //
@@ -244,6 +305,112 @@ async function main() {
           })),
         },
         `Fetched ${modules.length} module(s)`
+      );
+    }
+  );
+
+  // ========== Static Site Tools ==========
+
+  /**
+   * Best-effort workers.dev enablement after a deploy. Returns the public URL
+   * when everything succeeds, otherwise a note explaining what to do manually.
+   */
+  async function enableWorkersDev(
+    scriptName: string
+  ): Promise<{ url?: string; note?: string }> {
+    try {
+      await workers.setScriptSubdomain(scriptName, true);
+      const account = await workers.getAccountSubdomain();
+      const sub = account.result?.subdomain;
+      return sub
+        ? { url: `https://${scriptName}.${sub}.workers.dev` }
+        : { note: "workers.dev enabled, but the account has no workers.dev subdomain registered yet." };
+    } catch (error) {
+      return {
+        note: `Deployed, but enabling workers.dev failed: ${error instanceof Error ? error.message : String(error)}. Enable it with set_workers_dev or attach a custom domain.`,
+      };
+    }
+  }
+
+  addTool(
+    "deploy_static_site",
+    {
+      title: "Deploy Static Site",
+      description:
+        "Deploy a local directory as a static site on Workers (assets-only Worker): builds the file manifest, uploads only files Cloudflare doesn't already have, and deploys. By default the site is served on workers.dev. Set not_found_handling to 'single-page-application' for SPAs. A _headers or _redirects file at the directory root is applied as configuration, not uploaded.",
+      inputSchema: DeployStaticSiteSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const collected = await collectAssets(input.directory);
+      const upload = await uploadAssets(workers, input.script_name, collected.files);
+
+      const config: AssetsConfig = {
+        ...(input.html_handling && { html_handling: input.html_handling }),
+        ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
+        ...(collected.headers !== undefined && { _headers: collected.headers }),
+        ...(collected.redirects !== undefined && { _redirects: collected.redirects }),
+      };
+      const metadata: ScriptUploadMetadata = {
+        assets: {
+          jwt: upload.completionJwt,
+          ...(Object.keys(config).length > 0 && { config }),
+        },
+        compatibility_date: input.compatibility_date ?? todayISO(),
+      };
+
+      await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
+
+      const workersDev = input.enable_workers_dev
+        ? await enableWorkersDev(input.script_name)
+        : {};
+
+      return ok(
+        {
+          script_name: input.script_name,
+          files_total: collected.files.length,
+          files_uploaded: upload.uploaded,
+          files_reused: upload.skipped,
+          has_headers_file: collected.headers !== undefined,
+          has_redirects_file: collected.redirects !== undefined,
+          url: workersDev.url,
+          note: workersDev.note,
+        },
+        `Deployed ${collected.files.length} file(s) (${upload.uploaded} uploaded, ${upload.skipped} unchanged)` +
+          (workersDev.url ? ` — live at ${workersDev.url}` : "")
+      );
+    }
+  );
+
+  addTool(
+    "redeploy_assets",
+    {
+      title: "Redeploy Assets",
+      description:
+        "Create a new deployment of an assets-only Worker that reuses its previously uploaded files (keep_assets) — useful to change html_handling or not_found_handling without re-uploading the site.",
+      inputSchema: RedeployAssetsSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const config: AssetsConfig = {
+        ...(input.html_handling && { html_handling: input.html_handling }),
+        ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
+      };
+      const metadata: ScriptUploadMetadata = {
+        keep_assets: true,
+        ...(Object.keys(config).length > 0 && { assets: { config } }),
+        compatibility_date: input.compatibility_date ?? todayISO(),
+      };
+
+      await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
+
+      return ok(
+        {
+          script_name: input.script_name,
+          assets_reused: true,
+          config_applied: Object.keys(config).length > 0 ? config : undefined,
+        },
+        `Redeployed ${input.script_name} reusing existing assets`
       );
     }
   );
