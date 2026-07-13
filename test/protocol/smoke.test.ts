@@ -25,6 +25,7 @@ const EXPECTED_TOOLS = [
   "add_worker_domain",
   "delete_worker_domain",
   "set_workers_dev",
+  "query_worker_logs",
   "health_check",
 ].sort();
 

@@ -23,6 +23,7 @@ import { collectAssets, uploadAssets } from "./workers/assets.js";
 import {
   summarizeDeployment,
   summarizeDomain,
+  summarizeLogEvent,
   summarizeVersion,
   summarizeWorker,
 } from "./workers/summarize.js";
@@ -299,6 +300,28 @@ const SetCronTriggersSchema = z.object({
   crons: z
     .array(z.string().describe("Cron expression, e.g. */30 * * * *"))
     .describe("REPLACES the Worker's full cron trigger set; pass [] to remove all triggers"),
+});
+
+const QueryWorkerLogsSchema = z.object({
+  script_name: z.string().describe("The Worker whose logs to query"),
+  minutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(10080)
+    .optional()
+    .default(60)
+    .describe("Look-back window in minutes (default 60; retention is 3–7 days)"),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .default(20)
+    .describe("Maximum events to return (default 20)"),
+  errors_only: z.boolean().optional().describe("Only return events that carry an error"),
+  search: z.string().optional().describe("Full-text needle matched across all log fields"),
 });
 
 const HealthCheckSchema = z.object({});
@@ -1022,6 +1045,64 @@ async function main() {
         schedules.length === 0
           ? `Removed all cron triggers from ${input.script_name}`
           : `Set ${schedules.length} cron trigger(s) on ${input.script_name}`
+      );
+    }
+  );
+
+  // ========== Observability Tools ==========
+
+  addTool(
+    "query_worker_logs",
+    {
+      title: "Query Worker Logs",
+      description:
+        "Query a Worker's logs (Workers Logs / observability). Returns the most recent matching events with message, outcome, request, and timing. The Worker must have observability enabled (deploy_worker's enable_observability or update_worker_settings).",
+      inputSchema: QueryWorkerLogsSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const to = Date.now();
+      const from = to - input.minutes * 60_000;
+
+      const response = await workers.queryTelemetry({
+        queryId: "workers-mcp-logs",
+        timeframe: { from, to },
+        parameters: {
+          datasets: ["cloudflare-workers"],
+          filters: [
+            {
+              key: "$metadata.service",
+              operation: "eq",
+              type: "string",
+              value: input.script_name,
+            },
+            ...(input.errors_only
+              ? [{ key: "$metadata.error", operation: "exists", type: "string" as const }]
+              : []),
+          ],
+          calculations: [],
+          groupBys: [],
+          ...(input.search && { needle: { value: input.search, matchCase: false } }),
+        },
+        view: "events",
+        limit: input.limit,
+        dry: true,
+      });
+
+      const events = response.result?.events?.events ?? [];
+      const total = response.result?.events?.count ?? events.length;
+      return ok(
+        {
+          script_name: input.script_name,
+          timeframe: { from: new Date(from).toISOString(), to: new Date(to).toISOString() },
+          total_matching: total,
+          showing: events.length,
+          events: events.map(summarizeLogEvent),
+        },
+        `Retrieved ${events.length} of ${total} matching log event(s)` +
+          (events.length === 0
+            ? " — if you expected logs, check that the Worker has observability enabled and has received traffic in the window"
+            : "")
       );
     }
   );

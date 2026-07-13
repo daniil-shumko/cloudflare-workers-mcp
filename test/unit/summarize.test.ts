@@ -4,10 +4,12 @@ import assert from "node:assert/strict";
 import {
   summarizeDeployment,
   summarizeDomain,
+  summarizeLogEvent,
   summarizeVersion,
   summarizeWorker,
 } from "../../src/workers/summarize.js";
 import type {
+  TelemetryEvent,
   WorkerDeployment,
   WorkerDomain,
   WorkerScript,
@@ -107,6 +109,58 @@ test("summarizeDeployment keeps the version split and drops noise", () => {
     { version_id: "v-old", percentage: 90 },
     { version_id: "v-new", percentage: 10 },
   ]);
+});
+
+test("summarizeLogEvent flattens a fetch event and drops undefined fields", () => {
+  const event: TelemetryEvent = {
+    dataset: "cloudflare-workers",
+    timestamp: 1752364800000,
+    $metadata: {
+      id: "cursor-noise",
+      message: "handled request",
+      level: "log",
+      service: "my-worker",
+    },
+    $workers: {
+      scriptName: "my-worker",
+      outcome: "ok",
+      eventType: "fetch",
+      event: {
+        request: { method: "GET", path: "/api/users", url: "https://x.example/api/users" },
+        response: { status: 200 },
+      },
+      cpuTimeMs: 3,
+      wallTimeMs: 12,
+    },
+  };
+
+  const summary = summarizeLogEvent(event);
+
+  assert.deepEqual(summary, {
+    timestamp: "2025-07-13T00:00:00.000Z",
+    level: "log",
+    message: "handled request",
+    outcome: "ok",
+    event_type: "fetch",
+    request: "GET /api/users",
+    status: 200,
+    cpu_ms: 3,
+    wall_ms: 12,
+  });
+  assert.equal("error" in summary, false, "undefined fields must be dropped");
+});
+
+test("summarizeLogEvent falls back to the trigger for non-fetch events and tolerates bare events", () => {
+  const cron = summarizeLogEvent({
+    timestamp: 1752364800000,
+    $metadata: { trigger: "*/30 * * * *", error: "boom" },
+    $workers: { eventType: "scheduled", outcome: "exception" },
+  });
+  assert.equal(cron.request, "*/30 * * * *");
+  assert.equal(cron.error, "boom");
+
+  const bare = summarizeLogEvent({});
+  assert.deepEqual(bare, {});
 });
 
 test("summarizeDomain keeps the attachment fields", () => {

@@ -12,6 +12,8 @@ import type {
   CloudflareResponse,
   CronTriggerList,
   ScriptSubdomain,
+  TelemetryQueryRequest,
+  TelemetryQueryResult,
   WorkerDeployment,
   WorkerDeploymentList,
   WorkerDomain,
@@ -530,6 +532,22 @@ export class WorkersClient {
     return this.request<AccountSubdomain>(
       "GET",
       `/accounts/${this.accountId}/workers/subdomain`
+    );
+  }
+
+  // ==================== Observability ====================
+
+  /**
+   * Workers Logs query API (the endpoint the official observability MCP
+   * server wraps). Requires the Worker to have observability enabled.
+   */
+  async queryTelemetry(
+    body: TelemetryQueryRequest
+  ): Promise<CloudflareResponse<TelemetryQueryResult>> {
+    return this.request<TelemetryQueryResult>(
+      "POST",
+      `/accounts/${this.accountId}/workers/observability/telemetry/query`,
+      body
     );
   }
 

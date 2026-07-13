@@ -138,6 +138,42 @@ test("listDomains passes only the provided filters as query params", async () =>
   }
 });
 
+test("queryTelemetry POSTs the query body to the telemetry endpoint", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ events: { count: 1, events: [{ timestamp: 1752364800000 }] } }));
+
+    const client = makeClient();
+    const response = await client.queryTelemetry({
+      queryId: "workers-mcp-logs",
+      timeframe: { from: 1752361200000, to: 1752364800000 },
+      parameters: {
+        datasets: ["cloudflare-workers"],
+        filters: [{ key: "$metadata.service", operation: "eq", type: "string", value: "my-worker" }],
+        calculations: [],
+        groupBys: [],
+      },
+      view: "events",
+      limit: 20,
+      dry: true,
+    });
+
+    assert.equal(mock.calls[0].method, "POST");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/observability/telemetry/query`);
+    const body = JSON.parse(mock.calls[0].body as string) as {
+      timeframe: { from: number; to: number };
+      parameters: { filters: Array<{ value: string }> };
+      dry: boolean;
+    };
+    assert.equal(body.timeframe.from, 1752361200000);
+    assert.equal(body.parameters.filters[0].value, "my-worker");
+    assert.equal(body.dry, true);
+    assert.equal(response.result.events?.count, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("subdomain getters target the script and account subdomain endpoints", async () => {
   const mock = installMockFetch();
   try {

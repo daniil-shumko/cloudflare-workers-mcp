@@ -174,6 +174,74 @@ export interface AssetsConfig {
   _redirects?: string;
 }
 
+/** A filter leaf for the telemetry query API. */
+export interface TelemetryFilter {
+  key: string;
+  operation: string;
+  type: "string" | "number" | "boolean";
+  value?: string | number | boolean;
+}
+
+/** Request body for POST .../workers/observability/telemetry/query. */
+export interface TelemetryQueryRequest {
+  queryId: string;
+  timeframe: { from: number; to: number };
+  parameters: {
+    datasets: string[];
+    filters?: TelemetryFilter[];
+    calculations?: unknown[];
+    groupBys?: unknown[];
+    needle?: { value: string; isRegex?: boolean; matchCase?: boolean };
+  };
+  view?: "events" | "calculations" | "invocations";
+  limit?: number;
+  /** Execute without persisting the query run (the pattern the official MCP server uses). */
+  dry?: boolean;
+}
+
+/** One Workers Logs event. Loosely typed: the payload shape varies by event. */
+export interface TelemetryEvent {
+  dataset?: string;
+  /** Epoch milliseconds. */
+  timestamp?: number;
+  source?: unknown;
+  $metadata?: {
+    id?: string;
+    message?: string;
+    error?: string;
+    level?: string;
+    service?: string;
+    trigger?: string;
+    requestId?: string;
+    statusCode?: number;
+    duration?: number;
+    url?: string;
+    [key: string]: unknown;
+  };
+  $workers?: {
+    scriptName?: string;
+    outcome?: string;
+    eventType?: string;
+    requestId?: string;
+    event?: {
+      request?: { url?: string; method?: string; path?: string };
+      response?: { status?: number };
+      rpcMethod?: string;
+    };
+    cpuTimeMs?: number;
+    wallTimeMs?: number;
+    scriptVersion?: { id?: string; tag?: string; message?: string };
+    truncated?: boolean;
+    [key: string]: unknown;
+  };
+}
+
+/** Result of a telemetry query in the events view. */
+export interface TelemetryQueryResult {
+  events?: { count?: number; events?: TelemetryEvent[] };
+  [key: string]: unknown;
+}
+
 /**
  * The `metadata` part of a script/version multipart upload. Only the fields
  * this server sends are typed; the API accepts more (IMPLEMENTATION_PLAN.md §3).

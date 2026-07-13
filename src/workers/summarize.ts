@@ -4,6 +4,7 @@
  */
 
 import type {
+  TelemetryEvent,
   WorkerDeployment,
   WorkerDomain,
   WorkerScript,
@@ -95,4 +96,42 @@ export function summarizeDomain(domain: WorkerDomain): DomainSummary {
     service: domain.service,
     environment: domain.environment,
   };
+}
+
+export interface LogEventSummary {
+  timestamp?: string;
+  level?: string;
+  message?: string;
+  error?: string;
+  outcome?: string;
+  event_type?: string;
+  /** "GET /path" for fetch events, the cron expression for scheduled ones, etc. */
+  request?: string;
+  status?: number;
+  cpu_ms?: number;
+  wall_ms?: number;
+}
+
+export function summarizeLogEvent(event: TelemetryEvent): LogEventSummary {
+  const meta = event.$metadata ?? {};
+  const workers = event.$workers ?? {};
+  const request = workers.event?.request;
+  const summary: LogEventSummary = {
+    timestamp: event.timestamp !== undefined ? new Date(event.timestamp).toISOString() : undefined,
+    level: meta.level,
+    message: meta.message,
+    error: meta.error,
+    outcome: workers.outcome,
+    event_type: workers.eventType,
+    request: request
+      ? [request.method, request.path ?? request.url].filter(Boolean).join(" ") || undefined
+      : meta.trigger,
+    status: workers.event?.response?.status ?? meta.statusCode,
+    cpu_ms: workers.cpuTimeMs,
+    wall_ms: workers.wallTimeMs,
+  };
+  // Drop undefined keys so log lines stay compact.
+  return Object.fromEntries(
+    Object.entries(summary).filter(([, value]) => value !== undefined)
+  ) as LogEventSummary;
 }
