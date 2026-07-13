@@ -17,9 +17,11 @@ import {
   collectAssets,
   contentTypeFor,
   hashAsset,
+  isIgnored,
+  parseAssetsIgnore,
   uploadAssets,
 } from "../../src/workers/assets.js";
-import { WorkersClient } from "../../src/workers/client.js";
+import { WorkersClient, bucketUploadTimeoutMs } from "../../src/workers/client.js";
 import { installMockFetch, cfOk } from "../helpers/mock-fetch.js";
 
 const ACCOUNT = "acct-123";
@@ -84,14 +86,106 @@ test("collectAssets reads _headers/_redirects as config and excludes them from t
     await writeFile(join(dir, "_redirects"), "/old /new 301");
     await writeFile(join(dir, ".assetsignore"), "_worker.js");
 
-    const { files, headers, redirects } = await collectAssets(dir);
+    const { files, headers, redirects, hasAssetsIgnore, ignoredCount } = await collectAssets(dir);
 
     assert.deepEqual(files.map((f) => f.path).sort(), ["/css/style.css", "/index.html"]);
     assert.match(headers ?? "", /X-Frame-Options/);
     assert.equal(redirects, "/old /new 301");
+    assert.equal(hasAssetsIgnore, true);
+    assert.equal(ignoredCount, 0, "no file matches _worker.js");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("parseAssetsIgnore/isIgnored implement the gitignore-style subset", () => {
+  const rules = parseAssetsIgnore(
+    [
+      "# comment",
+      "",
+      "secrets/",
+      "*.map",
+      "!keep.map",
+      "/root-only.txt",
+      "docs/*.md",
+      "**/tmp",
+    ].join("\n")
+  );
+
+  // Directory rule: matches the dir at any depth, not files.
+  assert.equal(isIgnored(rules, "secrets", true), true);
+  assert.equal(isIgnored(rules, "a/secrets", true), true);
+  assert.equal(isIgnored(rules, "secrets", false), false);
+  // Glob at any depth, with a negation that wins by order.
+  assert.equal(isIgnored(rules, "app.js.map", false), true);
+  assert.equal(isIgnored(rules, "js/app.js.map", false), true);
+  assert.equal(isIgnored(rules, "keep.map", false), false);
+  // Leading slash anchors to the root.
+  assert.equal(isIgnored(rules, "root-only.txt", false), true);
+  assert.equal(isIgnored(rules, "sub/root-only.txt", false), false);
+  // A pattern with an inner slash is root-anchored; * stays within a segment.
+  assert.equal(isIgnored(rules, "docs/readme.md", false), true);
+  assert.equal(isIgnored(rules, "docs/sub/readme.md", false), false);
+  assert.equal(isIgnored(rules, "other/docs/readme.md", false), false);
+  // ** crosses segments.
+  assert.equal(isIgnored(rules, "a/b/tmp", false), true);
+});
+
+test("collectAssets applies .assetsignore rules and reports the excluded count", async () => {
+  const dir = await makeSiteDir();
+  try {
+    await mkdir(join(dir, "secrets"));
+    await writeFile(join(dir, "secrets", "api-key.txt"), "shh");
+    await writeFile(join(dir, "app.js.map"), "{}");
+    await writeFile(join(dir, "keep.map"), "{}");
+    await writeFile(join(dir, ".assetsignore"), "secrets/\n*.map\n!keep.map");
+
+    const { files, hasAssetsIgnore, ignoredCount } = await collectAssets(dir);
+
+    assert.equal(hasAssetsIgnore, true);
+    assert.deepEqual(files.map((f) => f.path).sort(), [
+      "/css/style.css",
+      "/index.html",
+      "/keep.map",
+    ]);
+    // app.js.map is counted; secrets/ was skipped as a whole directory.
+    assert.equal(ignoredCount, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("collectAssets rejects directory-symlink cycles with a clear error", async () => {
+  const dir = await makeSiteDir();
+  try {
+    await symlink(dir, join(dir, "loop"));
+    await assert.rejects(() => collectAssets(dir), /Symlink cycle detected/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("collectAssets allows sibling symlinks to the same in-root directory (no cycle)", async () => {
+  const dir = await makeSiteDir();
+  try {
+    await symlink(join(dir, "css"), join(dir, "styles"));
+    const { files } = await collectAssets(dir);
+    assert.deepEqual(files.map((f) => f.path).sort(), [
+      "/css/style.css",
+      "/index.html",
+      "/styles/style.css",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bucketUploadTimeoutMs scales with payload and stays within its floor/cap", () => {
+  assert.equal(bucketUploadTimeoutMs(0), 120_000);
+  // 32 MiB of base64 → floor + ~328 s.
+  const large = bucketUploadTimeoutMs(32 * 1024 * 1024);
+  assert.ok(large > 400_000 && large < 500_000, `got ${large}`);
+  assert.equal(bucketUploadTimeoutMs(10 * 1024 * 1024 * 1024), 1_800_000);
 });
 
 test("collectAssets rejects an empty or missing directory", async () => {

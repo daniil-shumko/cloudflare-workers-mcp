@@ -44,8 +44,6 @@ const { version: SERVER_VERSION } = JSON.parse(
 // validates inputs before the handler runs), and `z.infer` types the handler
 // arguments. There is intentionally no second, hand-written JSON Schema copy.
 
-const ListWorkersSchema = z.object({});
-
 const GetWorkerSchema = z.object({
   script_name: z.string().describe("The name of the Worker script"),
 });
@@ -107,8 +105,9 @@ const DeployStaticSiteSchema = z.object({
   enable_workers_dev: z
     .boolean()
     .optional()
-    .default(true)
-    .describe("Serve the site at <script_name>.<account>.workers.dev after deploying (default true)"),
+    .describe(
+      "Serve the site at <script_name>.<account>.workers.dev. Default: enabled for newly created Workers; existing Workers keep their current setting."
+    ),
 });
 
 const RedeployAssetsSchema = z.object({
@@ -188,8 +187,9 @@ const DeployWorkerSchema = z.object({
   enable_workers_dev: z
     .boolean()
     .optional()
-    .default(true)
-    .describe("Serve the Worker at <script_name>.<account>.workers.dev after deploying (default true)"),
+    .describe(
+      "Serve the Worker at <script_name>.<account>.workers.dev. Default: enabled for newly created Workers; existing Workers keep their current setting."
+    ),
 });
 
 const CreateVersionSchema = z.object({
@@ -324,9 +324,7 @@ const QueryWorkerLogsSchema = z.object({
   search: z.string().optional().describe("Full-text needle matched across all log fields"),
 });
 
-const HealthCheckSchema = z.object({});
-
-/** Today as YYYY-MM-DD — the default compatibility_date for new uploads. */
+/** Today as YYYY-MM-DD — the compatibility_date fallback for brand-new Workers. */
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -427,14 +425,40 @@ async function main() {
     );
   }
 
+  /**
+   * Register a tool that takes no input. Registered WITHOUT an inputSchema so
+   * the SDK advertises the empty object schema and skips argument validation —
+   * a spec-legal call that omits `arguments` entirely must not be rejected.
+   */
+  function addNoArgTool(
+    name: string,
+    config: { title: string; description: string; annotations?: ToolAnnotations },
+    handler: () => Promise<CallToolResult>
+  ): void {
+    server.registerTool(
+      name,
+      {
+        title: config.title,
+        description: config.description,
+        annotations: config.annotations,
+      },
+      (async (): Promise<CallToolResult> => {
+        try {
+          return await handler();
+        } catch (error) {
+          return fail(error);
+        }
+      }) as ToolCallback<undefined>
+    );
+  }
+
   // ========== Worker Tools ==========
 
-  addTool(
+  addNoArgTool(
     "list_workers",
     {
       title: "List Workers",
       description: "List all Worker scripts in your account. Returns each Worker's name, timestamps, and whether it serves static assets.",
-      inputSchema: ListWorkersSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async () => {
@@ -533,6 +557,22 @@ async function main() {
   // ========== Static Site Tools ==========
 
   /**
+   * The Worker's current settings, or null when it doesn't exist yet (or the
+   * probe fails — the subsequent upload surfaces any real error). Used to
+   * preserve an existing Worker's pinned compatibility_date and to decide
+   * whether a deploy should touch workers.dev at all.
+   */
+  async function getExistingSettings(
+    scriptName: string
+  ): Promise<{ compatibility_date?: string } | null> {
+    try {
+      return (await workers.getWorkerSettings(scriptName)).result ?? {};
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Best-effort workers.dev enablement after a deploy. Returns the public URL
    * when everything succeeds, otherwise a note explaining what to do manually.
    */
@@ -553,16 +593,52 @@ async function main() {
     }
   }
 
+  /**
+   * Report an existing Worker's workers.dev URL without changing its
+   * configuration (used when a redeploy leaves the subdomain setting alone).
+   */
+  async function workersDevStatus(scriptName: string): Promise<{ url?: string; note?: string }> {
+    try {
+      const [sub, account] = await Promise.all([
+        workers.getScriptSubdomain(scriptName),
+        workers.getAccountSubdomain(),
+      ]);
+      if (sub.result?.enabled && account.result?.subdomain) {
+        return { url: `https://${scriptName}.${account.result.subdomain}.workers.dev` };
+      }
+      return { note: "workers.dev serving is disabled for this Worker (unchanged by this deploy)." };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * The tri-state workers.dev decision after a deploy: an explicit true
+   * enables, explicit false leaves everything alone, and omitted enables only
+   * newly created Workers — a redeploy never re-exposes a Worker whose
+   * workers.dev serving was deliberately disabled.
+   */
+  async function applyWorkersDev(
+    scriptName: string,
+    requested: boolean | undefined,
+    isNew: boolean
+  ): Promise<{ url?: string; note?: string }> {
+    if (requested === false) return {};
+    if (requested === true || isNew) return enableWorkersDev(scriptName);
+    return workersDevStatus(scriptName);
+  }
+
   addTool(
     "deploy_static_site",
     {
       title: "Deploy Static Site",
       description:
-        "Deploy a local directory as a static site on Workers (assets-only Worker): builds the file manifest, uploads only files Cloudflare doesn't already have, and deploys. By default the site is served on workers.dev. Set not_found_handling to 'single-page-application' for SPAs. A _headers or _redirects file at the directory root is applied as configuration, not uploaded.",
+        "Deploy a local directory as a static site on Workers (assets-only Worker): builds the file manifest, uploads only files Cloudflare doesn't already have, and deploys. Newly created sites are served on workers.dev. Set not_found_handling to 'single-page-application' for SPAs. _headers/_redirects at the directory root are applied as configuration (not uploaded), and .assetsignore rules (gitignore-style) exclude files from the deploy.",
       inputSchema: DeployStaticSiteSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
+      const existing = await getExistingSettings(input.script_name);
       const collected = await collectAssets(input.directory);
       const upload = await uploadAssets(workers, input.script_name, collected.files);
 
@@ -577,14 +653,17 @@ async function main() {
           jwt: upload.completionJwt,
           ...(Object.keys(config).length > 0 && { config }),
         },
-        compatibility_date: input.compatibility_date ?? todayISO(),
+        compatibility_date:
+          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
       };
 
       await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
 
-      const workersDev = input.enable_workers_dev
-        ? await enableWorkersDev(input.script_name)
-        : {};
+      const workersDev = await applyWorkersDev(
+        input.script_name,
+        input.enable_workers_dev,
+        existing === null
+      );
 
       return ok(
         {
@@ -592,12 +671,15 @@ async function main() {
           files_total: collected.files.length,
           files_uploaded: upload.uploaded,
           files_reused: upload.skipped,
+          ...(collected.hasAssetsIgnore && { files_ignored: collected.ignoredCount }),
           has_headers_file: collected.headers !== undefined,
           has_redirects_file: collected.redirects !== undefined,
           url: workersDev.url,
           note: workersDev.note,
         },
-        `Deployed ${collected.files.length} file(s) (${upload.uploaded} uploaded, ${upload.skipped} unchanged)` +
+        `Deployed ${collected.files.length} file(s) (${upload.uploaded} uploaded, ${upload.skipped} unchanged` +
+          (collected.hasAssetsIgnore ? `, ${collected.ignoredCount} excluded by .assetsignore` : "") +
+          `)` +
           (workersDev.url ? ` — live at ${workersDev.url}` : "")
       );
     }
@@ -613,6 +695,7 @@ async function main() {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
+      const existing = await getExistingSettings(input.script_name);
       const config: AssetsConfig = {
         ...(input.html_handling && { html_handling: input.html_handling }),
         ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
@@ -620,7 +703,8 @@ async function main() {
       const metadata: ScriptUploadMetadata = {
         keep_assets: true,
         ...(Object.keys(config).length > 0 && { assets: { config } }),
-        compatibility_date: input.compatibility_date ?? todayISO(),
+        compatibility_date:
+          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
       };
 
       await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
@@ -655,10 +739,12 @@ async function main() {
         );
       }
 
+      const existing = await getExistingSettings(input.script_name);
       const metadata: ScriptUploadMetadata = {
         main_module: mainModule,
         ...(input.bindings && { bindings: input.bindings }),
-        compatibility_date: input.compatibility_date ?? todayISO(),
+        compatibility_date:
+          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
         ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
         ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
         ...(input.enable_observability !== undefined && {
@@ -671,9 +757,11 @@ async function main() {
         scriptUploadForm(metadata, input.modules)
       );
 
-      const workersDev = input.enable_workers_dev
-        ? await enableWorkersDev(input.script_name)
-        : {};
+      const workersDev = await applyWorkersDev(
+        input.script_name,
+        input.enable_workers_dev,
+        existing === null
+      );
 
       return ok(
         {
@@ -818,6 +906,7 @@ async function main() {
         );
       }
 
+      const existing = await getExistingSettings(input.script_name);
       const annotations: { "workers/message"?: string; "workers/tag"?: string } = {
         ...(input.message && { "workers/message": input.message }),
         ...(input.tag && { "workers/tag": input.tag }),
@@ -825,7 +914,8 @@ async function main() {
       const metadata: ScriptUploadMetadata = {
         main_module: mainModule,
         ...(input.bindings && { bindings: input.bindings }),
-        compatibility_date: input.compatibility_date ?? todayISO(),
+        compatibility_date:
+          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
         ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
         ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
         ...(Object.keys(annotations).length > 0 && { annotations }),
@@ -1109,12 +1199,11 @@ async function main() {
 
   // ========== Utility Tools ==========
 
-  addTool(
+  addNoArgTool(
     "health_check",
     {
       title: "Health Check",
       description: "Verify the API token is valid and connection to Cloudflare is working. Useful for troubleshooting authentication issues.",
-      inputSchema: HealthCheckSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async () => {

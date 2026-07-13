@@ -63,7 +63,8 @@ test(
   "live static-site lifecycle: deploy → serve → dedupe redeploy → delete",
   {
     skip: LIVE ? false : "set CF_LIVE_TEST=1 and CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID to run",
-    timeout: 300000,
+    // Must exceed the sum of the two 180 s serve-polls plus deploy overhead.
+    timeout: 600000,
   },
   async () => {
     const scriptName = `cf-mcp-test-${Date.now().toString(36)}`;

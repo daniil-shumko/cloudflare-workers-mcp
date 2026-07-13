@@ -66,6 +66,28 @@ test("downloadWorkerCode parses a multipart module response into one module per 
   }
 });
 
+test("downloadWorkerCode handles filename-less multipart parts as string entries (undici behavior)", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue({
+      status: 200,
+      headers: { "Content-Type": "multipart/form-data; boundary=x" },
+      form: [{ name: "index.js", content: "export default {}" }],
+    });
+
+    const client = makeClient();
+    const { modules } = await client.downloadWorkerCode("mod-worker");
+
+    assert.equal(modules.length, 1);
+    assert.equal(modules[0].name, "index.js");
+    assert.equal(modules[0].content, "export default {}");
+    // undici drops the part content type for filename-less parts.
+    assert.equal(modules[0].content_type, undefined);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("downloadWorkerCode surfaces the JSON error envelope on failure", async () => {
   const mock = installMockFetch();
   try {

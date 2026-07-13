@@ -44,6 +44,14 @@ export class CloudflareAPIError extends Error {
   }
 }
 
+/**
+ * Timeout for one asset-bucket upload: a 120 s floor plus ~1 s per 100 KiB of
+ * payload (a ~0.8 Mbps sustained-uplink allowance), capped at 30 minutes.
+ */
+export function bucketUploadTimeoutMs(payloadBytes: number): number {
+  return Math.min(1_800_000, 120_000 + Math.ceil(payloadBytes / 102_400) * 1000);
+}
+
 export class WorkersClient {
   private readonly baseUrl = "https://api.cloudflare.com/client/v4";
   private readonly apiToken: string;
@@ -304,18 +312,20 @@ export class WorkersClient {
   /**
    * Upload one bucket of base64-encoded asset files. Authenticates with the
    * upload-session JWT, not the account API token. The response that completes
-   * the manifest (HTTP 201) carries the completion JWT in `result.jwt`.
+   * the manifest (HTTP 201) carries the completion JWT in `result.jwt`. The
+   * timeout scales with the payload so large buckets survive slow uplinks.
    */
   async uploadAssetBucket(
     sessionJwt: string,
-    form: FormData
+    form: FormData,
+    payloadBytes = 0
   ): Promise<CloudflareResponse<AssetUploadResponse>> {
     return this.request<AssetUploadResponse>(
       "POST",
       `/accounts/${this.accountId}/workers/assets/upload`,
       form,
       { base64: true },
-      { bearer: sessionJwt, timeoutMs: 120000 }
+      { bearer: sessionJwt, timeoutMs: bucketUploadTimeoutMs(payloadBytes) }
     );
   }
 

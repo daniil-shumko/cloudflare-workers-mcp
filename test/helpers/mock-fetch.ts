@@ -79,8 +79,11 @@ export function installMockFetch(): MockFetch {
         if (!form) throw new TypeError("mock fetch: response has no form parts");
         const fd = new FormData();
         for (const part of form) {
-          if (part.type !== undefined || part.filename !== undefined) {
-            fd.append(part.name, new File([part.content], part.filename ?? part.name, { type: part.type }));
+          // Mirror undici: only parts carrying a filename become Files;
+          // filename-less parts are plain string entries (their content type
+          // is not preserved).
+          if (part.filename !== undefined) {
+            fd.append(part.name, new File([part.content], part.filename, { type: part.type }));
           } else {
             fd.append(part.name, part.content);
           }

@@ -5,7 +5,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFile, readdir, lstat, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readFile, readdir, lstat, realpath } from "node:fs/promises";
 import { extname, join, resolve, sep } from "node:path";
 
 import type { WorkersClient } from "./client.js";
@@ -40,6 +41,106 @@ export interface CollectedAssets {
   headers?: string;
   /** Contents of `_redirects` at the asset root, when present. */
   redirects?: string;
+  /** Whether a root `.assetsignore` was found and applied. */
+  hasAssetsIgnore: boolean;
+  /** Files excluded by `.assetsignore` rules. */
+  ignoredCount: number;
+}
+
+interface IgnoreRule {
+  regex: RegExp;
+  negated: boolean;
+  dirOnly: boolean;
+}
+
+/**
+ * Parse `.assetsignore` (gitignore-style, as wrangler treats it): comments and
+ * blank lines skipped, `!` negation (last match wins), leading `/` or an
+ * inner `/` anchors to the asset root, trailing `/` matches directories only,
+ * `*` matches within a segment, `**` across segments, `?` a single character.
+ * Character classes are not supported (brackets match literally).
+ */
+export function parseAssetsIgnore(content: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    let negated = false;
+    if (line.startsWith("!")) {
+      negated = true;
+      line = line.slice(1);
+    }
+    let dirOnly = false;
+    if (line.endsWith("/")) {
+      dirOnly = true;
+      line = line.slice(0, -1);
+    }
+    let anchored = false;
+    if (line.startsWith("/")) {
+      anchored = true;
+      line = line.slice(1);
+    } else if (line.includes("/")) {
+      anchored = true;
+    }
+    if (!line) continue;
+
+    let pattern = "";
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "*") {
+        if (line[i + 1] === "*") {
+          pattern += ".*";
+          i++;
+        } else {
+          pattern += "[^/]*";
+        }
+      } else if (ch === "?") {
+        pattern += "[^/]";
+      } else {
+        pattern += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      }
+    }
+    rules.push({
+      regex: new RegExp(`${anchored ? "^" : "(^|/)"}${pattern}$`),
+      negated,
+      dirOnly,
+    });
+  }
+  return rules;
+}
+
+/**
+ * Whether `relPath` (no leading slash) is excluded by the rules. Last matching
+ * rule wins; a rule matching a directory excludes everything inside it (the
+ * walk applies this by testing directories before descending).
+ */
+export function isIgnored(rules: IgnoreRule[], relPath: string, isDir: boolean): boolean {
+  let ignored = false;
+  for (const rule of rules) {
+    if (rule.dirOnly && !isDir) continue;
+    if (rule.regex.test(relPath)) ignored = !rule.negated;
+  }
+  return ignored;
+}
+
+/**
+ * Read a file without following a symlink at the final path component, and
+ * verify it is a regular file — closes the window between the walk's symlink
+ * containment check and the actual read (assets are read twice: once for
+ * hashing, once at upload).
+ */
+async function readAssetFile(filePath: string): Promise<Buffer> {
+  const handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw new Error(`Not a regular file: ${filePath}`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -103,19 +204,37 @@ export function contentTypeFor(path: string): string {
 
 /**
  * Walk `rootDir` and build the upload list. Rejects (throws) on: a missing or
- * empty directory, files over 25 MiB, more than 100k files, and symlinks that
- * escape the root. Non-regular files (sockets, fifos) are skipped. `_headers`
- * and `_redirects` at the root are read into strings and excluded from the
- * manifest, along with `.assetsignore` (not parsed — v1 uploads everything else).
+ * empty directory, files over 25 MiB, more than 100k files, symlinks that
+ * escape the root, and directory-symlink cycles. Non-regular files (sockets,
+ * fifos) are skipped. `_headers` and `_redirects` at the root are read into
+ * strings and excluded from the manifest; a root `.assetsignore` is parsed
+ * and its gitignore-style rules applied.
  */
 export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
   const root = await realpath(resolve(rootDir)).catch(() => {
     throw new Error(`Asset directory not found: ${rootDir}`);
   });
 
+  // Read the ignore rules up front so the walk can filter as it goes.
+  let ignoreRules: IgnoreRule[] = [];
+  let hasAssetsIgnore = false;
+  try {
+    const ignoreContent = await readFile(join(root, ".assetsignore"), "utf8");
+    hasAssetsIgnore = true;
+    ignoreRules = parseAssetsIgnore(ignoreContent);
+  } catch {
+    // No .assetsignore — nothing to filter.
+  }
+
   const files: AssetFile[] = [];
+  let ignoredCount = 0;
   let headers: string | undefined;
   let redirects: string | undefined;
+
+  // Canonical (realpath) directories on the current recursion path — a
+  // directory symlink resolving to one of these is a cycle. Distinct symlinks
+  // to the same directory on *sibling* branches stay legal (finite).
+  const ancestors = new Set<string>([root]);
 
   async function walk(dir: string, relPrefix: string): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
@@ -125,6 +244,10 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
 
       let isDir = entry.isDirectory();
       let isFile = entry.isFile();
+      // `dir` is always canonical (root is realpath-resolved and symlinked
+      // dirs recurse into their resolved target), so for regular entries the
+      // canonical path is just filePath.
+      let canonicalPath = filePath;
       if (entry.isSymbolicLink()) {
         // Follow the link but refuse anything that escapes the asset root —
         // a deploy must never leak files from outside the chosen directory.
@@ -137,21 +260,35 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
         const stat = await lstat(target);
         isDir = stat.isDirectory();
         isFile = stat.isFile();
+        canonicalPath = target;
       }
 
       if (isDir) {
-        await walk(filePath, relPath);
+        if (isIgnored(ignoreRules, relPath.slice(1), true)) continue;
+        if (ancestors.has(canonicalPath)) {
+          throw new Error(
+            `Symlink cycle detected in asset directory: ${relPath} resolves to a directory already being walked.`
+          );
+        }
+        ancestors.add(canonicalPath);
+        await walk(canonicalPath, relPath);
+        ancestors.delete(canonicalPath);
         continue;
       }
       if (!isFile) continue; // sockets, fifos, devices
 
       if (relPrefix === "" && CONFIG_FILES.has(entry.name)) {
-        if (entry.name === "_headers") headers = await readFile(filePath, "utf8");
-        if (entry.name === "_redirects") redirects = await readFile(filePath, "utf8");
+        if (entry.name === "_headers") headers = (await readAssetFile(canonicalPath)).toString("utf8");
+        if (entry.name === "_redirects") redirects = (await readAssetFile(canonicalPath)).toString("utf8");
         continue;
       }
 
-      const content = await readFile(filePath);
+      if (isIgnored(ignoreRules, relPath.slice(1), false)) {
+        ignoredCount += 1;
+        continue;
+      }
+
+      const content = await readAssetFile(canonicalPath);
       if (content.length > MAX_FILE_SIZE) {
         throw new Error(
           `${relPath} is ${(content.length / (1024 * 1024)).toFixed(1)} MiB — Cloudflare limits static assets to 25 MiB per file.`
@@ -160,7 +297,7 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
 
       files.push({
         path: relPath,
-        filePath,
+        filePath: canonicalPath,
         size: content.length,
         hash: hashAsset(content, relPath),
         contentType: contentTypeFor(relPath),
@@ -180,7 +317,7 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
     throw new Error(`No files found in asset directory: ${rootDir}`);
   }
 
-  return { files, headers, redirects };
+  return { files, headers, redirects, hasAssetsIgnore, ignoredCount };
 }
 
 export function buildManifest(files: AssetFile[]): AssetManifest {
@@ -234,6 +371,7 @@ export async function uploadAssets(
 
   for (const bucket of buckets) {
     const form = new FormData();
+    let payloadBytes = 0;
     for (const hash of bucket) {
       const file = byHash.get(hash);
       if (!file) {
@@ -241,11 +379,12 @@ export async function uploadAssets(
           `Upload session asked for unknown file hash ${hash} — the directory may have changed mid-deploy; retry.`
         );
       }
-      const base64 = (await readFile(file.filePath)).toString("base64");
+      const base64 = (await readAssetFile(file.filePath)).toString("base64");
+      payloadBytes += base64.length;
       form.append(hash, new File([base64], file.path.slice(1), { type: file.contentType }));
       uploaded += 1;
     }
-    const response = await client.uploadAssetBucket(sessionJwt, form);
+    const response = await client.uploadAssetBucket(sessionJwt, form, payloadBytes);
     if (response.result?.jwt) {
       completionJwt = response.result.jwt;
     }

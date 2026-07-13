@@ -137,7 +137,10 @@ Show me the errors my-api logged in the last 2 hours
   directory uploads zero bytes and still creates a new version.
 - A `_headers` or `_redirects` file at the directory root is applied as
   configuration ([syntax](https://developers.cloudflare.com/workers/static-assets/headers/)),
-  not uploaded as a public asset. `.assetsignore` is excluded but not parsed.
+  not uploaded as a public asset. A root `.assetsignore` is applied with
+  gitignore-style rules (globs, `!` negation, `dir/` and `/anchored`
+  patterns; character classes unsupported) and the result reports how many
+  files it excluded.
 - Limits: 25 MiB per file; 20,000 files per version on free plans
   (100,000 on paid). Static-asset requests are free and unmetered.
 - Symlinks inside the directory are followed; symlinks pointing outside it
@@ -154,8 +157,13 @@ Show me the errors my-api logged in the last 2 hours
 ### Domains & serving
 - Custom domains require the zone to be **active in the same Cloudflare
   account** — external/partial zones are not supported (unlike Pages).
-- Deploy tools enable workers.dev serving by default so the result carries
-  a working URL; pass `enable_workers_dev: false` to opt out.
+- Deploy tools enable workers.dev serving for **newly created** Workers so
+  the result carries a working URL. Redeploys never change an existing
+  Worker's workers.dev setting unless `enable_workers_dev` is passed
+  explicitly — a deliberately disabled Worker stays private.
+- When `compatibility_date` is omitted, deploys **preserve the existing
+  Worker's pinned date** (new Workers get today's date) — a redeploy never
+  silently activates newer runtime behavior.
 
 ### Cron & logs
 - `set_cron_triggers` **replaces** the full trigger set; pass `[]` to clear.
