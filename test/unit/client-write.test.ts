@@ -88,6 +88,77 @@ test("deleteWorker targets the script endpoint and only sends force when set", a
   }
 });
 
+test("createVersion POSTs multipart to /versions", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "v-new", number: 4 }));
+
+    const form = new FormData();
+    form.append(
+      "metadata",
+      new File([JSON.stringify({ main_module: "index.js" })], "metadata.json", {
+        type: "application/json",
+      })
+    );
+
+    const client = makeClient();
+    const response = await client.createVersion("my-worker", form);
+
+    assert.equal(mock.calls[0].method, "POST");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/versions`);
+    assert.ok(mock.calls[0].body instanceof FormData);
+    assert.equal(response.result.number, 4);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("createDeployment POSTs the percentage strategy and only sends force when set", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "d-1", strategy: "percentage", versions: [{ version_id: "v-old", percentage: 100 }] }));
+    mock.enqueue(cfOk({ id: "d-2", strategy: "percentage", versions: [] }));
+
+    const client = makeClient();
+    await client.createDeployment("my-worker", {
+      strategy: "percentage",
+      versions: [{ version_id: "v-old", percentage: 100 }],
+      annotations: { "workers/message": "rollback" },
+    });
+    await client.createDeployment(
+      "my-worker",
+      { strategy: "percentage", versions: [{ version_id: "v-new", percentage: 100 }] },
+      true
+    );
+
+    assert.equal(mock.calls[0].method, "POST");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/deployments`);
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), {
+      strategy: "percentage",
+      versions: [{ version_id: "v-old", percentage: 100 }],
+      annotations: { "workers/message": "rollback" },
+    });
+    assert.equal(mock.calls[1].url, `${BASE}/workers/scripts/my-worker/deployments?force=true`);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getVersion targets the version-detail endpoint", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "v-1", number: 1, resources: { bindings: [] } }));
+
+    const client = makeClient();
+    const response = await client.getVersion("my-worker", "v-1");
+
+    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/versions/v-1`);
+    assert.deepEqual(response.result.resources, { bindings: [] });
+  } finally {
+    mock.restore();
+  }
+});
+
 test("setScriptSubdomain POSTs enabled (and previews only when specified)", async () => {
   const mock = installMockFetch();
   try {

@@ -12,6 +12,7 @@ import type {
   CloudflareResponse,
   CronTriggerList,
   ScriptSubdomain,
+  WorkerDeployment,
   WorkerDeploymentList,
   WorkerDomain,
   WorkerModule,
@@ -392,12 +393,62 @@ export class WorkersClient {
     );
   }
 
+  async getVersion(
+    scriptName: string,
+    versionId: string
+  ): Promise<CloudflareResponse<WorkerVersion>> {
+    return this.request<WorkerVersion>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions/${encodeURIComponent(versionId)}`
+    );
+  }
+
+  /**
+   * Upload a version WITHOUT deploying it (staged). Same multipart shape as a
+   * script upload, but version metadata accepts a narrower field set (no
+   * migrations/logpush/tail_consumers).
+   */
+  async createVersion(
+    scriptName: string,
+    form: FormData
+  ): Promise<CloudflareResponse<WorkerVersion>> {
+    return this.request<WorkerVersion>(
+      "POST",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`,
+      form,
+      undefined,
+      { timeoutMs: 120000 }
+    );
+  }
+
   async listDeployments(
     scriptName: string
   ): Promise<CloudflareResponse<WorkerDeploymentList>> {
     return this.request<WorkerDeploymentList>(
       "GET",
       `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/deployments`
+    );
+  }
+
+  /**
+   * Create a deployment: map live traffic onto one version (percentage 100)
+   * or split it across two. Rollback is this same call with an older
+   * version_id at 100%. `force` pushes past blocks like a changed secret.
+   */
+  async createDeployment(
+    scriptName: string,
+    body: {
+      strategy: "percentage";
+      versions: Array<{ version_id: string; percentage: number }>;
+      annotations?: { "workers/message"?: string; "workers/triggered_by"?: string };
+    },
+    force?: boolean
+  ): Promise<CloudflareResponse<WorkerDeployment>> {
+    return this.request<WorkerDeployment>(
+      "POST",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/deployments`,
+      body,
+      force ? { force: true } : undefined
     );
   }
 

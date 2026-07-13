@@ -61,6 +61,11 @@ const ListDeploymentsSchema = z.object({
   script_name: z.string().describe("The name of the Worker script"),
 });
 
+const GetVersionSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  version_id: z.string().describe("Version ID (from list_versions)"),
+});
+
 const GetCronTriggersSchema = z.object({
   script_name: z.string().describe("The name of the Worker script"),
 });
@@ -184,6 +189,60 @@ const DeployWorkerSchema = z.object({
     .optional()
     .default(true)
     .describe("Serve the Worker at <script_name>.<account>.workers.dev after deploying (default true)"),
+});
+
+const CreateVersionSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  modules: z
+    .array(ModuleSchema)
+    .min(1)
+    .describe("ES modules; the first is the entry point unless main_module says otherwise"),
+  main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
+  bindings: z.array(BindingSchema).optional().describe("Resource bindings for this version"),
+  compatibility_date: z.string().optional().describe("YYYY-MM-DD; defaults to today"),
+  compatibility_flags: z.array(z.string()).optional(),
+  keep_assets: z
+    .boolean()
+    .optional()
+    .describe("Retain the previous version's static assets"),
+  message: z
+    .string()
+    .optional()
+    .describe("Version message (workers/message annotation, shown in the dashboard)"),
+  tag: z.string().optional().describe("Version tag (workers/tag annotation)"),
+});
+
+const DeploymentVersionSchema = z.object({
+  version_id: z.string().describe("Version ID (from list_versions or create_version)"),
+  percentage: z.number().gt(0).max(100).describe("Share of traffic for this version"),
+});
+
+const CreateDeploymentSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  versions: z
+    .array(DeploymentVersionSchema)
+    .min(1)
+    .max(2)
+    .describe(
+      "One version at 100%, or two versions splitting traffic (e.g. 90/10 for a gradual rollout). Percentages must sum to 100."
+    ),
+  message: z.string().optional().describe("Deployment message (workers/message annotation)"),
+  force: z
+    .boolean()
+    .optional()
+    .describe("Deploy even if normally blocked (e.g. a secret changed since the target version)"),
+});
+
+const RollbackWorkerSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  version_id: z
+    .string()
+    .describe("The older version to roll back to (must be among the 100 most recent versions)"),
+  message: z.string().optional().describe("Rollback message (workers/message annotation)"),
+  force: z
+    .boolean()
+    .optional()
+    .describe("Roll back even if normally blocked (e.g. a secret changed since that version)"),
 });
 
 const DeleteWorkerSchema = z.object({
@@ -665,6 +724,140 @@ async function main() {
       return ok(
         { script_name: input.script_name, deployments },
         `Found ${deployments.length} deployment(s)`
+      );
+    }
+  );
+
+  addTool(
+    "get_version",
+    {
+      title: "Get Version",
+      description:
+        "Get a Worker version's detail: bindings, compatibility date/flags, handlers, and usage model for that immutable snapshot.",
+      inputSchema: GetVersionSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.getVersion(input.script_name, input.version_id);
+      const version = response.result;
+      return ok({
+        script_name: input.script_name,
+        version: summarizeVersion(version),
+        resources: version.resources,
+      });
+    }
+  );
+
+  addTool(
+    "create_version",
+    {
+      title: "Create Version (staged)",
+      description:
+        "Upload a new Worker version WITHOUT deploying it — live traffic is unchanged until the version is referenced by create_deployment. Use for staged rollouts.",
+      inputSchema: CreateVersionSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const mainModule = input.main_module ?? input.modules[0].name;
+      if (!input.modules.some((m) => m.name === mainModule)) {
+        throw new Error(
+          `main_module "${mainModule}" does not match any provided module name (${input.modules.map((m) => m.name).join(", ")}).`
+        );
+      }
+
+      const annotations: { "workers/message"?: string; "workers/tag"?: string } = {
+        ...(input.message && { "workers/message": input.message }),
+        ...(input.tag && { "workers/tag": input.tag }),
+      };
+      const metadata: ScriptUploadMetadata = {
+        main_module: mainModule,
+        ...(input.bindings && { bindings: input.bindings }),
+        compatibility_date: input.compatibility_date ?? todayISO(),
+        ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
+        ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
+        ...(Object.keys(annotations).length > 0 && { annotations }),
+      };
+
+      const response = await workers.createVersion(
+        input.script_name,
+        scriptUploadForm(metadata, input.modules)
+      );
+
+      return ok(
+        {
+          script_name: input.script_name,
+          version: summarizeVersion(response.result),
+          deployed: false,
+        },
+        `Created staged version ${response.result?.number ?? ""} (${response.result?.id}) — deploy it with create_deployment`
+      );
+    }
+  );
+
+  addTool(
+    "create_deployment",
+    {
+      title: "Create Deployment",
+      description:
+        "Point live traffic at Worker versions: a single version at 100%, or a gradual rollout splitting traffic across two versions (e.g. 90/10). Percentages must sum to 100.",
+      inputSchema: CreateDeploymentSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const total = input.versions.reduce((sum, v) => sum + v.percentage, 0);
+      if (Math.abs(total - 100) > 0.001) {
+        throw new Error(`Version percentages must sum to 100 (got ${total}).`);
+      }
+
+      const response = await workers.createDeployment(
+        input.script_name,
+        {
+          strategy: "percentage",
+          versions: input.versions,
+          ...(input.message && { annotations: { "workers/message": input.message } }),
+        },
+        input.force
+      );
+
+      return ok(
+        {
+          script_name: input.script_name,
+          deployment: summarizeDeployment(response.result),
+        },
+        `Deployment created: ${input.versions.map((v) => `${v.version_id} @ ${v.percentage}%`).join(", ")}`
+      );
+    }
+  );
+
+  addTool(
+    "rollback_worker",
+    {
+      title: "Rollback Worker",
+      description:
+        "Roll a Worker back by deploying an older version at 100% traffic. Only the 100 most recent versions are eligible; bound resources (KV, R2, D1 data) are NOT reverted.",
+      inputSchema: RollbackWorkerSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.createDeployment(
+        input.script_name,
+        {
+          strategy: "percentage",
+          versions: [{ version_id: input.version_id, percentage: 100 }],
+          annotations: {
+            "workers/message": input.message ?? `Rollback to version ${input.version_id}`,
+          },
+        },
+        input.force
+      );
+
+      return ok(
+        {
+          script_name: input.script_name,
+          rolled_back_to: input.version_id,
+          deployment: summarizeDeployment(response.result),
+        },
+        `Rolled ${input.script_name} back to version ${input.version_id}`
       );
     }
   );
