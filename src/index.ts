@@ -115,6 +115,103 @@ const RedeployAssetsSchema = z.object({
     .describe("Worker compatibility date (YYYY-MM-DD); defaults to today"),
 });
 
+// The v1 binding subset (IMPLEMENTATION_PLAN.md M3). Values pass through to
+// metadata.bindings verbatim; the discriminated union keeps each type's
+// required fields honest.
+const BindingSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("plain_text"),
+    name: z.string().describe("Variable name exposed to the Worker"),
+    text: z.string().describe("The value"),
+  }),
+  z.object({
+    type: z.literal("secret_text"),
+    name: z.string().describe("Variable name exposed to the Worker"),
+    text: z.string().describe("The secret value (never returned by reads)"),
+  }),
+  z.object({
+    type: z.literal("kv_namespace"),
+    name: z.string().describe("Variable name exposed to the Worker"),
+    namespace_id: z.string().describe("KV namespace ID"),
+  }),
+  z.object({
+    type: z.literal("r2_bucket"),
+    name: z.string().describe("Variable name exposed to the Worker"),
+    bucket_name: z.string().describe("R2 bucket name"),
+  }),
+  z.object({
+    type: z.literal("d1"),
+    name: z.string().describe("Variable name exposed to the Worker"),
+    id: z.string().describe("D1 database ID"),
+  }),
+  z.object({
+    type: z.literal("assets"),
+    name: z.string().describe("Variable name for the Worker's own static assets (e.g. ASSETS)"),
+  }),
+]);
+
+const ModuleSchema = z.object({
+  name: z.string().describe("Module filename, e.g. index.js"),
+  content: z.string().describe("Module source code"),
+  content_type: z
+    .string()
+    .optional()
+    .describe("Part content type (default application/javascript+module)"),
+});
+
+const DeployWorkerSchema = z.object({
+  script_name: z
+    .string()
+    .describe("Worker name (lowercase, alphanumeric and hyphens)"),
+  modules: z.array(ModuleSchema).min(1).describe("ES modules; the first is the entry point unless main_module says otherwise"),
+  main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
+  bindings: z.array(BindingSchema).optional().describe("Resource bindings (replaces the full set)"),
+  compatibility_date: z
+    .string()
+    .optional()
+    .describe("YYYY-MM-DD; defaults to today (if omitted at the API level it would fall back to 2021-11-02)"),
+  compatibility_flags: z.array(z.string()).optional(),
+  keep_assets: z
+    .boolean()
+    .optional()
+    .describe("Retain the previous version's static assets (deploy code changes to a site without re-uploading files)"),
+  enable_observability: z
+    .boolean()
+    .optional()
+    .describe("Enable Workers Logs for this Worker (required for query_worker_logs)"),
+  enable_workers_dev: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("Serve the Worker at <script_name>.<account>.workers.dev after deploying (default true)"),
+});
+
+const DeleteWorkerSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script to delete"),
+  force: z
+    .boolean()
+    .optional()
+    .describe("Delete even if other resources (e.g. routes) depend on the Worker"),
+});
+
+const UpdateWorkerSettingsSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  bindings: z
+    .array(BindingSchema)
+    .optional()
+    .describe("Resource bindings — REPLACES the Worker's full binding set"),
+  compatibility_date: z.string().optional().describe("YYYY-MM-DD"),
+  compatibility_flags: z.array(z.string()).optional(),
+  logpush: z.boolean().optional(),
+  observability: z
+    .object({
+      enabled: z.boolean(),
+      head_sampling_rate: z.number().min(0).max(1).optional(),
+    })
+    .optional()
+    .describe("Workers Logs configuration"),
+});
+
 const HealthCheckSchema = z.object({});
 
 /** Today as YYYY-MM-DD — the default compatibility_date for new uploads. */
@@ -124,14 +221,26 @@ function todayISO(): string {
 
 /**
  * Build the multipart body for a script upload: a `metadata` JSON part plus
- * one part per module (none for an assets-only Worker).
+ * one part per module (none for an assets-only Worker). Module part names are
+ * the filenames that metadata.main_module references.
  */
-function scriptUploadForm(metadata: ScriptUploadMetadata): FormData {
+function scriptUploadForm(
+  metadata: ScriptUploadMetadata,
+  modules: Array<{ name: string; content: string; content_type?: string }> = []
+): FormData {
   const form = new FormData();
   form.append(
     "metadata",
     new File([JSON.stringify(metadata)], "metadata.json", { type: "application/json" })
   );
+  for (const mod of modules) {
+    form.append(
+      mod.name,
+      new File([mod.content], mod.name, {
+        type: mod.content_type ?? "application/javascript+module",
+      })
+    );
+  }
   return form;
 }
 
@@ -411,6 +520,107 @@ async function main() {
           config_applied: Object.keys(config).length > 0 ? config : undefined,
         },
         `Redeployed ${input.script_name} reusing existing assets`
+      );
+    }
+  );
+
+  // ========== Worker Lifecycle Tools ==========
+
+  addTool(
+    "deploy_worker",
+    {
+      title: "Deploy Worker",
+      description:
+        "Upload and deploy a Worker script (ES modules) with optional bindings (plain_text, secret_text, kv_namespace, r2_bucket, d1, assets). Replaces the Worker's code and binding set if it already exists. Set keep_assets to retain a site's static assets while updating code. By default the Worker is served on workers.dev.",
+      inputSchema: DeployWorkerSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const mainModule = input.main_module ?? input.modules[0].name;
+      if (!input.modules.some((m) => m.name === mainModule)) {
+        throw new Error(
+          `main_module "${mainModule}" does not match any provided module name (${input.modules.map((m) => m.name).join(", ")}).`
+        );
+      }
+
+      const metadata: ScriptUploadMetadata = {
+        main_module: mainModule,
+        ...(input.bindings && { bindings: input.bindings }),
+        compatibility_date: input.compatibility_date ?? todayISO(),
+        ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
+        ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
+        ...(input.enable_observability !== undefined && {
+          observability: { enabled: input.enable_observability },
+        }),
+      };
+
+      const response = await workers.uploadScript(
+        input.script_name,
+        scriptUploadForm(metadata, input.modules)
+      );
+
+      const workersDev = input.enable_workers_dev
+        ? await enableWorkersDev(input.script_name)
+        : {};
+
+      return ok(
+        {
+          script_name: input.script_name,
+          main_module: mainModule,
+          modules: input.modules.map((m) => m.name),
+          bindings: (input.bindings ?? []).map((b) => ({ type: b.type, name: b.name })),
+          compatibility_date: metadata.compatibility_date,
+          etag: response.result?.etag,
+          url: workersDev.url,
+          note: workersDev.note,
+        },
+        `Deployed ${input.script_name}` + (workersDev.url ? ` — live at ${workersDev.url}` : "")
+      );
+    }
+  );
+
+  addTool(
+    "delete_worker",
+    {
+      title: "Delete Worker",
+      description:
+        "Permanently delete a Worker script, including its versions, deployments, and any static assets. Set force to delete even when other resources depend on it.",
+      inputSchema: DeleteWorkerSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      await workers.deleteWorker(input.script_name, input.force);
+      return ok(
+        { script_name: input.script_name, deleted: true },
+        `Deleted Worker '${input.script_name}'`
+      );
+    }
+  );
+
+  addTool(
+    "update_worker_settings",
+    {
+      title: "Update Worker Settings",
+      description:
+        "Update a Worker's settings (bindings, compatibility date/flags, logpush, observability) without re-uploading its code. Note: bindings REPLACE the Worker's full binding set.",
+      inputSchema: UpdateWorkerSettingsSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const { script_name, ...fields } = input;
+      const settings = Object.fromEntries(
+        Object.entries(fields).filter(([, value]) => value !== undefined)
+      );
+      if (Object.keys(settings).length === 0) {
+        throw new Error(
+          "No updatable fields provided. Specify at least one of: bindings, compatibility_date, compatibility_flags, logpush, observability."
+        );
+      }
+
+      const response = await workers.patchWorkerSettings(script_name, settings);
+      return ok(
+        { script_name, settings: response.result },
+        `Updated settings for '${script_name}'`
       );
     }
   );

@@ -82,14 +82,14 @@ test(
       env: { ...(process.env as Record<string, string>) },
     });
     const client = new Client({ name: "live", version: "0.0.0" }, { capabilities: {} });
-    // Direct API client for cleanup (the delete_worker tool arrives with M3;
-    // switch cleanup to the tool then, keeping this as the finally-fallback).
+    // Direct API client for finally-fallback cleanup; the happy path deletes
+    // through the delete_worker tool.
     const direct = new WorkersClient(
       process.env.CLOUDFLARE_API_TOKEN!,
       process.env.CLOUDFLARE_ACCOUNT_ID!
     );
 
-    let needsCleanup: string | null = null;
+    const needsCleanup = new Set<string>();
 
     async function call(name: string, args: Record<string, unknown>): Promise<ToolResult> {
       const result = await client.callTool({ name, arguments: args });
@@ -113,7 +113,7 @@ test(
 
       // Mark for cleanup BEFORE the deploy: a partially failed deploy can
       // still have created the script.
-      needsCleanup = scriptName;
+      needsCleanup.add(scriptName);
       const deploy = await call("deploy_static_site", {
         script_name: scriptName,
         directory: siteDir,
@@ -148,13 +148,39 @@ test(
       const versions = await call("list_versions", { script_name: scriptName });
       assert.ok((versions.payload.data?.versions?.length ?? 0) >= 2, "each deploy creates a version");
 
-      // Delete and unmark cleanup.
-      await direct.deleteWorker(scriptName, true);
-      needsCleanup = null;
+      // A module Worker via deploy_worker, served on workers.dev.
+      const workerName = `${scriptName}-w`;
+      needsCleanup.add(workerName);
+      const deployWorker = await call("deploy_worker", {
+        script_name: workerName,
+        modules: [
+          {
+            name: "index.js",
+            content:
+              "export default { fetch() { return new Response('hello from cf-mcp-test worker'); } }",
+          },
+        ],
+      });
+      assert.equal(
+        deployWorker.isError,
+        false,
+        `deploy_worker failed: ${JSON.stringify(deployWorker.payload)}`
+      );
+      const workerUrl = deployWorker.payload.data?.url;
+      assert.ok(workerUrl, "expected a workers.dev URL for the module Worker");
+      const workerBody = await fetchUntilOk(workerUrl, 180000);
+      assert.match(workerBody, /hello from cf-mcp-test worker/);
+
+      // Delete both through the tool and unmark cleanup.
+      for (const name of [workerName, scriptName]) {
+        const del = await call("delete_worker", { script_name: name, force: true });
+        assert.equal(del.isError, false, `delete_worker failed: ${JSON.stringify(del.payload)}`);
+        needsCleanup.delete(name);
+      }
     } finally {
-      if (needsCleanup) {
+      for (const name of needsCleanup) {
         try {
-          await direct.deleteWorker(needsCleanup, true);
+          await direct.deleteWorker(name, true);
         } catch {
           // Best-effort cleanup; don't mask the real assertion failure.
         }

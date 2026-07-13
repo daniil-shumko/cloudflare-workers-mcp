@@ -334,6 +334,27 @@ export class WorkersClient {
     );
   }
 
+  /**
+   * Partial settings update (bindings, compat date/flags, observability, …)
+   * without re-uploading code. The body is multipart/form-data with a single
+   * `settings` JSON part — NOT a plain JSON body.
+   */
+  async patchWorkerSettings(
+    scriptName: string,
+    settings: Record<string, unknown>
+  ): Promise<CloudflareResponse<WorkerScriptSettings>> {
+    const form = new FormData();
+    form.append(
+      "settings",
+      new File([JSON.stringify(settings)], "settings.json", { type: "application/json" })
+    );
+    return this.request<WorkerScriptSettings>(
+      "PATCH",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`,
+      form
+    );
+  }
+
   /** Delete a Worker script. `force` breaks dependencies (e.g. routes). */
   async deleteWorker(
     scriptName: string,
