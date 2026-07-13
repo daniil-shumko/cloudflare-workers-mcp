@@ -9,13 +9,13 @@ deploying static sites and Worker scripts, and managing versions, deployments,
 custom domains, and cron triggers. It connects via stdio transport for use with
 Claude Desktop and Claude Code.
 
-**Project status: early development.** The repo is a working skeleton — 3
-read-only tools (`list_workers`, `get_worker`, `health_check`), a full test
-harness, and a researched roadmap. **Read `IMPLEMENTATION_PLAN.md` before
-adding tools** — it carries verified API endpoint documentation (including the
-static-asset direct-upload protocol, the headline feature), the proposed tool
-surface, milestones, and design gotchas. It is the source of truth for what to
-build next.
+**Project status: feature-complete v1.** All six milestones (M1–M6) are
+implemented — 22 tools covering static-site deploys (the headline feature),
+script lifecycle, versions/deployments/rollback, domains/subdomain/cron, and
+log queries. **Read `IMPLEMENTATION_PLAN.md` before changing API-facing
+code** — it carries verified API endpoint documentation (including the
+static-asset direct-upload protocol) and the design gotchas; all endpoint
+facts were re-verified against live Cloudflare docs on 2026-07-13.
 
 This repo is the successor to
 [cloudflare-pages-mcp](https://github.com/daniil-shumko/cloudflare-pages-mcp)
@@ -46,7 +46,7 @@ npm start
 npm test               # unit + protocol smoke (safe, no creds, CI-ready)
 npm run test:unit      # pure-logic units, fully mocked fetch
 npm run test:protocol  # builds, then drives the real server over the MCP stdio wire
-npm run test:live      # guarded live e2e placeholder — implemented with milestone M2
+npm run test:live      # guarded live e2e: deploys/serves/deletes a throwaway cf-mcp-test-* site
 npm run typecheck:test # type-check the test files too (tsconfig.test.json)
 ```
 
@@ -65,6 +65,7 @@ src/
 ├── index.ts           # MCP server entry, tool definitions & handlers
 ├── workers/
 │   ├── client.ts      # Cloudflare Workers API HTTP client (WorkersClient)
+│   ├── assets.ts      # Manifest hashing + asset upload-session/bucket flow
 │   ├── summarize.ts   # Pure response summarizers
 │   └── types.ts       # TypeScript types for API requests/responses
 └── utils/
@@ -72,9 +73,6 @@ src/
     ├── errors.ts        # Error formatting for MCP responses
     └── rate-limiter.ts  # Token-bucket rate limiter for API calls
 ```
-
-(`src/workers/assets.ts` — manifest hashing and the asset upload-session flow —
-arrives with milestone M2; see IMPLEMENTATION_PLAN.md §5.)
 
 ### Key Patterns
 
@@ -99,7 +97,8 @@ Every tool carries `annotations` (`readOnlyHint`, `destructiveHint`,
   everything else is JSON
 
 **Response Formatting**: Tools return summarized responses using helper functions:
-- `summarizeWorker()` (more summarizers land with their tools) - reduce full API responses
+- `summarizeWorker()`, `summarizeVersion()`, `summarizeDeployment()`,
+  `summarizeDomain()`, `summarizeLogEvent()` - reduce full API responses
 - `formatSuccess()`, `formatError()` - consistent MCP output structure; results
   carry both a JSON text block and `structuredContent`
 
