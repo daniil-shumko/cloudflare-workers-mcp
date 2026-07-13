@@ -5,9 +5,17 @@
 
 import { TokenBucketRateLimiter } from "../utils/rate-limiter.js";
 import type {
+  AccountSubdomain,
   CloudflareResponse,
+  CronTriggerList,
+  ScriptSubdomain,
+  WorkerDeploymentList,
+  WorkerDomain,
+  WorkerModule,
   WorkerScript,
   WorkerScriptSettings,
+  WorkerVersion,
+  WorkerVersionList,
 } from "./types.js";
 
 export class CloudflareAPIError extends Error {
@@ -188,6 +196,141 @@ export class WorkersClient {
     return this.request<WorkerScriptSettings>(
       "GET",
       `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`
+    );
+  }
+
+  /**
+   * Download a Worker's code (legacy `GET .../scripts/{name}`). Service-worker
+   * scripts come back as a single body; module-syntax scripts come back as
+   * multipart/form-data with one part per module — normalized here to a
+   * uniform module list. This bypasses `request()` because the response is
+   * raw script content, not the JSON envelope (errors still use the envelope).
+   */
+  async downloadWorkerCode(
+    scriptName: string
+  ): Promise<{ contentType: string; modules: WorkerModule[] }> {
+    await this.rateLimiter.acquire();
+
+    const url = `${this.baseUrl}/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${this.apiToken}` },
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new CloudflareAPIError(
+            [{ code: 0, message: "Request timed out after 30 seconds" }],
+            408
+          );
+        }
+        throw error;
+      }
+
+      if (!response.ok) {
+        // Error responses use the standard JSON envelope.
+        const text = await response.text();
+        let errors: Array<{ code: number; message: string }> | undefined;
+        try {
+          errors = (JSON.parse(text) as CloudflareResponse<unknown>).errors;
+        } catch {
+          errors = [{ code: response.status, message: this.snippet(text, response.statusText) }];
+        }
+        throw new CloudflareAPIError(errors, response.status);
+      }
+
+      const contentType = response.headers.get("content-type") ?? "";
+      if (contentType.includes("multipart/form-data")) {
+        const form = await response.formData();
+        const modules: WorkerModule[] = [];
+        for (const [name, value] of form.entries()) {
+          if (typeof value === "string") {
+            modules.push({ name, content: value });
+          } else {
+            modules.push({
+              name: value.name || name,
+              content_type: value.type || undefined,
+              content: await value.text(),
+            });
+          }
+        }
+        return { contentType, modules };
+      }
+
+      const content = await response.text();
+      return {
+        contentType,
+        modules: [{ name: scriptName, content_type: contentType || undefined, content }],
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  // ==================== Versions & Deployments ====================
+
+  async listVersions(
+    scriptName: string
+  ): Promise<CloudflareResponse<WorkerVersionList | WorkerVersion[]>> {
+    return this.request<WorkerVersionList | WorkerVersion[]>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`
+    );
+  }
+
+  async listDeployments(
+    scriptName: string
+  ): Promise<CloudflareResponse<WorkerDeploymentList>> {
+    return this.request<WorkerDeploymentList>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/deployments`
+    );
+  }
+
+  // ==================== Cron, Domains, Subdomain ====================
+
+  async getCronTriggers(
+    scriptName: string
+  ): Promise<CloudflareResponse<CronTriggerList>> {
+    return this.request<CronTriggerList>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/schedules`
+    );
+  }
+
+  async listDomains(filters?: {
+    hostname?: string;
+    service?: string;
+    zone_name?: string;
+    zone_id?: string;
+    environment?: string;
+  }): Promise<CloudflareResponse<WorkerDomain[]>> {
+    return this.request<WorkerDomain[]>(
+      "GET",
+      `/accounts/${this.accountId}/workers/domains`,
+      undefined,
+      filters
+    );
+  }
+
+  async getScriptSubdomain(
+    scriptName: string
+  ): Promise<CloudflareResponse<ScriptSubdomain>> {
+    return this.request<ScriptSubdomain>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`
+    );
+  }
+
+  async getAccountSubdomain(): Promise<CloudflareResponse<AccountSubdomain>> {
+    return this.request<AccountSubdomain>(
+      "GET",
+      `/accounts/${this.accountId}/workers/subdomain`
     );
   }
 

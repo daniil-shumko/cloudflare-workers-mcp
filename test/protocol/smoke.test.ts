@@ -7,6 +7,11 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const EXPECTED_TOOLS = [
   "list_workers",
   "get_worker",
+  "get_worker_code",
+  "list_versions",
+  "list_deployments",
+  "get_cron_triggers",
+  "list_worker_domains",
   "health_check",
 ].sort();
 

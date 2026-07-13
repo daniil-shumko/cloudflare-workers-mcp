@@ -57,3 +57,90 @@ export interface WorkerScriptSettings {
   tail_consumers?: Array<{ service: string; environment?: string; namespace?: string }> | null;
   observability?: Record<string, unknown>;
 }
+
+/**
+ * One module of a downloaded Worker script. Service-worker-syntax scripts
+ * yield a single module; module-syntax scripts are returned by the API as
+ * multipart/form-data with one part per module.
+ */
+export interface WorkerModule {
+  name: string;
+  content_type?: string;
+  content: string;
+}
+
+/**
+ * A Worker version from GET .../scripts/{name}/versions (list) or
+ * /{version_id} (detail). Annotations ("workers/message" etc.) are accepted on
+ * version *upload* but are not returned by the documented read endpoints.
+ */
+export interface WorkerVersion {
+  id: string;
+  number?: number;
+  metadata?: {
+    author_email?: string;
+    author_id?: string;
+    created_on?: string;
+    modified_on?: string;
+    /** camelCase in the API response. */
+    hasPreview?: boolean;
+    source?: string;
+    [key: string]: unknown;
+  };
+  /** Present on the version-detail and create-version endpoints only: bindings, script, script_runtime. */
+  resources?: Record<string, unknown>;
+  startup_time_ms?: number;
+}
+
+/** Versions list responses wrap the array in { items }. */
+export interface WorkerVersionList {
+  items?: WorkerVersion[];
+}
+
+export interface WorkerDeployment {
+  id: string;
+  source?: string;
+  strategy?: string;
+  author_email?: string;
+  created_on?: string;
+  annotations?: Record<string, unknown>;
+  versions?: Array<{ version_id: string; percentage: number }>;
+}
+
+/** Deployments list responses wrap the array in { deployments }. */
+export interface WorkerDeploymentList {
+  deployments?: WorkerDeployment[];
+}
+
+export interface CronTrigger {
+  cron: string;
+  created_on?: string;
+  modified_on?: string;
+}
+
+/** GET/PUT .../schedules responses wrap the array in { schedules }. */
+export interface CronTriggerList {
+  schedules?: CronTrigger[];
+}
+
+/** A custom domain attachment from /workers/domains. */
+export interface WorkerDomain {
+  id: string;
+  cert_id?: string;
+  zone_id?: string;
+  zone_name?: string;
+  hostname?: string;
+  service?: string;
+  environment?: string;
+}
+
+/** Per-script workers.dev subdomain config (GET/POST .../scripts/{name}/subdomain). */
+export interface ScriptSubdomain {
+  enabled?: boolean;
+  previews_enabled?: boolean;
+}
+
+/** Account-level workers.dev subdomain (GET/PUT /workers/subdomain). */
+export interface AccountSubdomain {
+  subdomain?: string;
+}

@@ -24,6 +24,13 @@ export interface CannedResponse {
   json?: unknown;
   /** Raw response body text (use for non-JSON / edge-HTML cases). */
   text?: string;
+  /** Response headers (name → value), exposed via `response.headers.get()`. */
+  headers?: Record<string, string>;
+  /**
+   * Multipart form parts exposed via `response.formData()` (used by module
+   * Worker downloads). Also set a multipart `content-type` header when using this.
+   */
+  form?: Array<{ name: string; content: string; type?: string; filename?: string }>;
 }
 
 export interface MockFetch {
@@ -56,15 +63,31 @@ export function installMockFetch(): MockFetch {
     if (!item) throw new Error(`mock fetch: no queued response for ${url}`);
     if (item.kind === "error") throw item.err;
 
-    const { status = 200, ok, statusText = "", json, text } = item.res;
+    const { status = 200, ok, statusText = "", json, text, headers: resHeaders = {}, form } = item.res;
     const bodyText = text !== undefined ? text : json !== undefined ? JSON.stringify(json) : "";
+    const lowerHeaders = Object.fromEntries(
+      Object.entries(resHeaders).map(([k, v]) => [k.toLowerCase(), v])
+    );
     return {
       ok: ok ?? (status >= 200 && status < 300),
       status,
       statusText,
+      headers: { get: (name: string) => lowerHeaders[name.toLowerCase()] ?? null },
       text: async () => bodyText,
       json: async () => JSON.parse(bodyText),
-    } as Response;
+      formData: async () => {
+        if (!form) throw new TypeError("mock fetch: response has no form parts");
+        const fd = new FormData();
+        for (const part of form) {
+          if (part.type !== undefined || part.filename !== undefined) {
+            fd.append(part.name, new File([part.content], part.filename ?? part.name, { type: part.type }));
+          } else {
+            fd.append(part.name, part.content);
+          }
+        }
+        return fd;
+      },
+    } as unknown as Response;
   }) as typeof fetch;
 
   globalThis.fetch = fake;
