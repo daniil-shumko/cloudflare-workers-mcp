@@ -1,0 +1,62 @@
+{
+  "name": "cloudflare-workers-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for managing Cloudflare Workers: deploy static sites and Worker scripts, manage versions, deployments, custom domains, and cron triggers",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cloudflare-workers-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --clean",
+    "dev": "tsup src/index.ts --format esm --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
+    "test": "npm run test:unit && npm run test:protocol",
+    "test:unit": "node --import tsx --test \"test/unit/**/*.test.ts\"",
+    "test:protocol": "npm run build && node --import tsx --test \"test/protocol/**/*.test.ts\"",
+    "test:live": "CF_LIVE_TEST=1 node --import tsx --test \"test/integration/**/*.test.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "static-assets",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "deployments"
+  ],
+  "author": "Daniil Shumko",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daniil-shumko/cloudflare-workers-mcp.git"
+  },
+  "homepage": "https://github.com/daniil-shumko/cloudflare-workers-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/daniil-shumko/cloudflare-workers-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
