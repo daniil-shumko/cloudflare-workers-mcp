@@ -127,8 +127,36 @@ test("parseAssetsIgnore/isIgnored implement the gitignore-style subset", () => {
   assert.equal(isIgnored(rules, "docs/readme.md", false), true);
   assert.equal(isIgnored(rules, "docs/sub/readme.md", false), false);
   assert.equal(isIgnored(rules, "other/docs/readme.md", false), false);
-  // ** crosses segments.
+  // A full ** segment matches ZERO or more segments (gitignore semantics).
   assert.equal(isIgnored(rules, "a/b/tmp", false), true);
+  assert.equal(isIgnored(rules, "tmp", false), true);
+
+  const zeroSeg = parseAssetsIgnore("a/**/b\nc/**");
+  assert.equal(isIgnored(zeroSeg, "a/b", false), true);
+  assert.equal(isIgnored(zeroSeg, "a/x/y/b", false), true);
+  assert.equal(isIgnored(zeroSeg, "a/xb", false), false);
+  // Trailing /** matches everything inside, not the directory path itself.
+  assert.equal(isIgnored(zeroSeg, "c/deep/file.txt", false), true);
+  assert.equal(isIgnored(zeroSeg, "c", false), false);
+});
+
+test("collectAssets skips ignored entries before symlink checks — an ignored out-of-root symlink can't abort the deploy", async () => {
+  const outside = await mkdtemp(join(tmpdir(), "cf-mcp-outside-ign-"));
+  const dir = await makeSiteDir();
+  try {
+    await writeFile(join(outside, "secret.txt"), "secret");
+    await symlink(join(outside, "secret.txt"), join(dir, "leak.txt"));
+    await symlink(join(dir, "missing-target"), join(dir, "broken.txt"));
+    await writeFile(join(dir, ".assetsignore"), "leak.txt\nbroken.txt");
+
+    const { files, ignoredCount } = await collectAssets(dir);
+
+    assert.deepEqual(files.map((f) => f.path).sort(), ["/css/style.css", "/index.html"]);
+    assert.equal(ignoredCount, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 test("collectAssets applies .assetsignore rules and reports the excluded count", async () => {

@@ -85,21 +85,31 @@ export function parseAssetsIgnore(content: string): IgnoreRule[] {
     }
     if (!line) continue;
 
+    // Translate segment-wise so a full `**` segment can match ZERO segments,
+    // as gitignore requires: `**/foo` matches root-level foo, `a/**/b`
+    // matches a/b. A `**` inside a segment degrades to `*`.
+    const segments = line.split("/");
     let pattern = "";
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === "*") {
-        if (line[i + 1] === "*") {
-          pattern += ".*";
-          i++;
-        } else {
-          pattern += "[^/]*";
-        }
-      } else if (ch === "?") {
-        pattern += "[^/]";
-      } else {
-        pattern += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    for (let s = 0; s < segments.length; s++) {
+      const segment = segments[s];
+      if (segment === "**") {
+        // Trailing `/**` means everything inside; elsewhere, zero or more
+        // whole segments (the separator is part of the group).
+        pattern += s === segments.length - 1 ? ".*" : "(?:.*/)?";
+        continue;
       }
+      for (let i = 0; i < segment.length; i++) {
+        const ch = segment[i];
+        if (ch === "*") {
+          while (segment[i + 1] === "*") i++;
+          pattern += "[^/]*";
+        } else if (ch === "?") {
+          pattern += "[^/]";
+        } else {
+          pattern += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+        }
+      }
+      if (s < segments.length - 1) pattern += "/";
     }
     rules.push({
       regex: new RegExp(`${anchored ? "^" : "(^|/)"}${pattern}$`),
@@ -241,6 +251,20 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
     for (const entry of entries) {
       const filePath = join(dir, entry.name);
       const relPath = `${relPrefix}/${entry.name}`;
+      const relNoSlash = relPath.slice(1);
+
+      // Ignore rules run BEFORE any symlink resolution: an explicitly ignored
+      // entry must never abort the deploy, even if it is a broken or
+      // out-of-root symlink.
+      if (entry.isDirectory()) {
+        if (isIgnored(ignoreRules, relNoSlash, true)) continue;
+      } else if (
+        isIgnored(ignoreRules, relNoSlash, false) ||
+        (entry.isSymbolicLink() && isIgnored(ignoreRules, relNoSlash, true))
+      ) {
+        ignoredCount += 1;
+        continue;
+      }
 
       let isDir = entry.isDirectory();
       let isFile = entry.isFile();
@@ -264,7 +288,6 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
       }
 
       if (isDir) {
-        if (isIgnored(ignoreRules, relPath.slice(1), true)) continue;
         if (ancestors.has(canonicalPath)) {
           throw new Error(
             `Symlink cycle detected in asset directory: ${relPath} resolves to a directory already being walked.`
@@ -280,11 +303,6 @@ export async function collectAssets(rootDir: string): Promise<CollectedAssets> {
       if (relPrefix === "" && CONFIG_FILES.has(entry.name)) {
         if (entry.name === "_headers") headers = (await readAssetFile(canonicalPath)).toString("utf8");
         if (entry.name === "_redirects") redirects = (await readAssetFile(canonicalPath)).toString("utf8");
-        continue;
-      }
-
-      if (isIgnored(ignoreRules, relPath.slice(1), false)) {
-        ignoredCount += 1;
         continue;
       }
 

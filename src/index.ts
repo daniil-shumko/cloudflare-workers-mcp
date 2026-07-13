@@ -18,7 +18,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { WorkersClient } from "./workers/client.js";
+import { CloudflareAPIError, WorkersClient } from "./workers/client.js";
 import { collectAssets, uploadAssets } from "./workers/assets.js";
 import {
   summarizeDeployment,
@@ -557,18 +557,23 @@ async function main() {
   // ========== Static Site Tools ==========
 
   /**
-   * The Worker's current settings, or null when it doesn't exist yet (or the
-   * probe fails — the subsequent upload surfaces any real error). Used to
+   * The Worker's current settings, or null when it doesn't exist yet. Used to
    * preserve an existing Worker's pinned compatibility_date and to decide
-   * whether a deploy should touch workers.dev at all.
+   * whether a deploy should touch workers.dev at all. Only a definitive 404
+   * means "new" — a transient probe failure aborts the deploy rather than
+   * risk treating an existing Worker as new (which would re-enable
+   * workers.dev and bump its compatibility date).
    */
   async function getExistingSettings(
     scriptName: string
   ): Promise<{ compatibility_date?: string } | null> {
     try {
       return (await workers.getWorkerSettings(scriptName)).result ?? {};
-    } catch {
-      return null;
+    } catch (error) {
+      if (error instanceof CloudflareAPIError && error.statusCode === 404) {
+        return null;
+      }
+      throw error;
     }
   }
 
