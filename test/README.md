@@ -10,7 +10,7 @@ framework. TypeScript runs directly; source is imported with `.js` specifiers
 | Path | Layer | Hits the network? | Needs creds? |
 | --- | --- | --- | --- |
 | `test/unit/**` | Pure logic — summarizers, error formatting, rate limiter, config, and the `WorkersClient` HTTP layer with a mocked `fetch` | No | No |
-| `test/protocol/**` | End-to-end MCP protocol over stdio: all tools advertised, input-schema validation, error/result shape. Spawns the real server with **dummy** creds | No* | No |
+| `test/protocol/**` | End-to-end MCP protocol over stdio, run once per protocol era (2025 `initialize` and 2026-07-28 `server/discover`): all tools advertised, input-schema validation, error/result shape. Spawns the real server with **dummy** creds | No* | No |
 | `test/integration/**` | **Guarded** live lifecycle against a **real** Cloudflare account: deploy a throwaway static site, verify it serves over HTTP, exercise dedupe, delete it | Yes | Yes |
 
 \* The protocol test uses a dummy token, so the tool calls it makes fail

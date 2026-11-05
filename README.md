@@ -38,6 +38,10 @@ so this server's headline feature is:
 - **deploy_static_site** - Deploy a local directory as a static site: manifest hashing, server-side dedupe (unchanged files never re-upload), `_headers`/`_redirects` support, SPA/404 handling, `base_path` URL prefix (where Cloudflare has enabled it for the account), live workers.dev URL in the result
 - **redeploy_assets** - Redeploy reusing already-uploaded files and asset config (`keep_assets`), e.g. to bump the compatibility date. To change `html_handling`/`not_found_handling`/`base_path`, re-run `deploy_static_site`: unchanged files dedupe, so nothing re-uploads
 
+### Previews (beta)
+- **deploy_preview** - Deploy a preview of a site directory or Worker code without touching production, at a stable `https://<preview>-<worker>.<account>.workers.dev` URL plus a per-deployment URL. Redeploying the same `preview_name` updates it
+- **list_previews / delete_preview** - List a Worker's previews with their URLs, or delete one by name
+
 ### Workers
 - **list_workers** - List all Worker scripts in your account
 - **get_worker** - Settings (bindings, compat date/flags, placement, observability) plus cron triggers and workers.dev status
@@ -45,6 +49,11 @@ so this server's headline feature is:
 - **deploy_worker** - Upload and deploy ES-module Workers with bindings (`plain_text`, `secret_text`, `kv_namespace`, `r2_bucket`, `d1`, `assets`)
 - **update_worker_settings** - Change bindings/compat/logpush/observability without re-uploading code
 - **delete_worker** - Permanently delete a Worker (optional `force`)
+
+### Secrets
+- **list_secrets** - Secret names and types on a Worker (values are never returned)
+- **set_secrets** - Set or delete several secrets in one new deployed version (`null` deletes) without touching code or other bindings
+- **delete_secret** - Remove one secret
 
 ### Versions & deployments
 - **list_versions / get_version** - Immutable version history and per-version detail
@@ -58,6 +67,7 @@ so this server's headline feature is:
 - **get_cron_triggers / set_cron_triggers** - Read or replace a Worker's cron trigger set
 
 ### Observability
+- **tail_worker** - Live tail like `wrangler tail` for a short window (up to 50 s): requests, `console.log` output, exceptions and outcomes. Works on any Worker. Pass `trigger_url` to send a request once connected and capture it in the same call
 - **query_worker_logs** - Workers Logs with time window, error filter, full-text search, and cursor paging to older events (`next_cursor`). Requires observability enabled on the Worker
 - **health_check** - Verify API token and connection to Cloudflare
 
@@ -142,6 +152,18 @@ Attach app.example.com to my-api and add a cron trigger every 30 minutes
 Show me the errors my-api logged in the last 2 hours
 ```
 
+```
+Tail my-api while you hit /checkout and tell me why it throws
+```
+
+```
+Deploy ./dist as a preview of my-blog called redesign
+```
+
+```
+Rotate STRIPE_KEY on my-api and remove the old LEGACY_TOKEN secret
+```
+
 ## Important Notes
 
 ### Static site deploys
@@ -182,6 +204,18 @@ Show me the errors my-api logged in the last 2 hours
 - `query_worker_logs` needs the Worker uploaded with observability enabled
   (`deploy_worker`'s `enable_observability`, or `update_worker_settings`).
   Retention is 3 days (free) / 7 days (paid).
+- `tail_worker` needs no setup but only sees traffic during its window, so use
+  `trigger_url` (https only, redirects not followed) or send traffic while it
+  runs. Request headers and `cf` metadata are dropped from the results.
+
+### Secrets & previews
+- Every `set_secrets` / `delete_secret` call creates **and deploys** a new
+  version. Secret values travel through the conversation, so for highly
+  sensitive values `wrangler secret put` keeps them out of it.
+- Previews use Cloudflare's **beta** Worker Previews API and attach to an
+  existing Worker (deploy production first). `deploy_preview` turns on the
+  Worker's preview URLs (`previews_enabled`) if they are off. It never
+  changes production workers.dev serving.
 
 ## Development
 

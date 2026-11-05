@@ -20,6 +20,11 @@ import type {
   WorkerModule,
   WorkerScript,
   WorkerScriptSettings,
+  PreviewDeployment,
+  PreviewDeploymentBody,
+  WorkerPreview,
+  WorkerSecret,
+  WorkerTail,
   WorkerVersion,
   WorkerVersionList,
 } from "./types.js";
@@ -542,6 +547,128 @@ export class WorkersClient {
     return this.request<AccountSubdomain>(
       "GET",
       `/accounts/${this.accountId}/workers/subdomain`
+    );
+  }
+
+  // ==================== Secrets ====================
+  //
+  // GA endpoints on the scripts path (not part of the legacy-API deprecation).
+  // Reads return only {name, type} — values are never echoed. Every write
+  // creates AND deploys a new version (verified live 2026-11-05).
+
+  async listSecrets(scriptName: string): Promise<CloudflareResponse<WorkerSecret[]>> {
+    return this.request<WorkerSecret[]>(
+      "GET",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`
+    );
+  }
+
+  /**
+   * Create/update/delete several secrets in ONE new version (JSON Merge
+   * Patch): a string value sets a secret_text, null deletes, omitted names
+   * are left unchanged.
+   */
+  async patchSecrets(
+    scriptName: string,
+    secrets: Record<string, string | null>
+  ): Promise<CloudflareResponse<Record<string, WorkerSecret>>> {
+    const body = {
+      secrets: Object.fromEntries(
+        Object.entries(secrets).map(([name, text]) => [
+          name,
+          text === null ? null : { type: "secret_text", text },
+        ])
+      ),
+    };
+    return this.request<Record<string, WorkerSecret>>(
+      "PATCH",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/secrets-bulk`,
+      body
+    );
+  }
+
+  async deleteSecret(scriptName: string, secretName: string): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(
+        scriptName
+      )}/secrets/${encodeURIComponent(secretName)}`
+    );
+  }
+
+  // ==================== Worker Previews (beta, new Workers API) ====================
+  //
+  // Only exist on /workers/workers/{worker}. That path accepts the Worker
+  // NAME as the id, so callers keep using script names. Verified live
+  // 2026-11-05: preview deployments never touch production; preview URLs are
+  // only routable once the Worker's subdomain has previews_enabled.
+
+  private workerPath(scriptName: string): string {
+    return `/accounts/${this.accountId}/workers/workers/${encodeURIComponent(scriptName)}`;
+  }
+
+  async listPreviews(
+    scriptName: string,
+    filters?: { name?: string; page?: number; per_page?: number }
+  ): Promise<CloudflareResponse<WorkerPreview[]>> {
+    return this.request<WorkerPreview[]>(
+      "GET",
+      `${this.workerPath(scriptName)}/previews`,
+      undefined,
+      filters as Record<string, string | number | undefined> | undefined
+    );
+  }
+
+  async createPreview(scriptName: string, name: string): Promise<CloudflareResponse<WorkerPreview>> {
+    return this.request<WorkerPreview>("POST", `${this.workerPath(scriptName)}/previews`, { name });
+  }
+
+  async getPreview(scriptName: string, previewId: string): Promise<CloudflareResponse<WorkerPreview>> {
+    return this.request<WorkerPreview>(
+      "GET",
+      `${this.workerPath(scriptName)}/previews/${encodeURIComponent(previewId)}`
+    );
+  }
+
+  async deletePreview(scriptName: string, previewId: string): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      `${this.workerPath(scriptName)}/previews/${encodeURIComponent(previewId)}`
+    );
+  }
+
+  async createPreviewDeployment(
+    scriptName: string,
+    previewId: string,
+    body: PreviewDeploymentBody
+  ): Promise<CloudflareResponse<PreviewDeployment>> {
+    return this.request<PreviewDeployment>(
+      "POST",
+      `${this.workerPath(scriptName)}/previews/${encodeURIComponent(previewId)}/deployments`,
+      body
+    );
+  }
+
+  // ==================== Live tail ====================
+  //
+  // The classic tail (what `wrangler tail` uses): POST creates a short-lived
+  // tail and returns a WebSocket URL speaking the "trace-v1" subprotocol.
+  // Works on any Worker — no observability setting required.
+
+  async createTail(scriptName: string): Promise<CloudflareResponse<WorkerTail>> {
+    return this.request<WorkerTail>(
+      "POST",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/tails`,
+      {}
+    );
+  }
+
+  async deleteTail(scriptName: string, tailId: string): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(
+        scriptName
+      )}/tails/${encodeURIComponent(tailId)}`
     );
   }
 

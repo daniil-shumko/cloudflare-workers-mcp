@@ -13,21 +13,34 @@
  */
 
 import { readFileSync } from "node:fs";
-import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/server";
+import type {
+  ToolCallback,
+  CallToolResult,
+  ServerContext,
+  ToolAnnotations,
+} from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import { CloudflareAPIError, WorkersClient } from "./workers/client.js";
 import { collectAssets, uploadAssets } from "./workers/assets.js";
+import { collectTail } from "./workers/tail.js";
 import {
   summarizeDeployment,
   summarizeDomain,
   summarizeLogEvent,
+  summarizeTailEvent,
   summarizeVersion,
   summarizeWorker,
 } from "./workers/summarize.js";
-import type { AssetsConfig, ScriptUploadMetadata, WorkerVersion } from "./workers/types.js";
+import type {
+  AssetsConfig,
+  PreviewDeploymentBody,
+  ScriptUploadMetadata,
+  WorkerPreview,
+  WorkerVersion,
+} from "./workers/types.js";
 import { loadConfig } from "./utils/config.js";
 import { formatError, formatSuccess } from "./utils/errors.js";
 
@@ -331,6 +344,108 @@ const SetCronTriggersSchema = z.object({
     .describe("REPLACES the Worker's full cron trigger set; pass [] to remove all triggers"),
 });
 
+const DeployPreviewSchema = z
+  .object({
+    script_name: z.string().describe("The existing Worker to preview (deploy production first)"),
+    preview_name: z
+      .string()
+      .min(1)
+      .describe(
+        "Preview name, e.g. a branch name. An existing preview with this name is reused, so its stable URL stays the same across deploys."
+      ),
+    directory: z
+      .string()
+      .optional()
+      .describe("Static site: path to the built site directory (same handling as deploy_static_site)"),
+    html_handling: HtmlHandlingSchema,
+    not_found_handling: NotFoundHandlingSchema,
+    modules: z
+      .array(ModuleSchema)
+      .min(1)
+      .optional()
+      .describe("Worker code: ES modules; the first is the entry point unless main_module says otherwise"),
+    main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
+    bindings: z.array(BindingSchema).optional().describe("Bindings for the preview (modules mode)"),
+    compatibility_date: z
+      .string()
+      .optional()
+      .describe("YYYY-MM-DD; defaults to the Worker's current compatibility date"),
+    compatibility_flags: z.array(z.string()).optional().describe("Runtime compatibility flags"),
+    enable_preview_urls: z
+      .boolean()
+      .optional()
+      .describe(
+        "Turn on the Worker's preview URLs (subdomain previews_enabled) if they are off. Without it previews deploy but aren't routable. Default true. Production workers.dev serving is never changed."
+      ),
+  })
+  .refine((input) => (input.directory === undefined) !== (input.modules === undefined), {
+    message: "Provide exactly one of directory (static site) or modules (Worker code)",
+  });
+
+const ListPreviewsSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+});
+
+const DeletePreviewSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  preview: z.string().min(1).describe("Preview name, slug or id (from list_previews)"),
+});
+
+const ListSecretsSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+});
+
+const SetSecretsSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  secrets: z
+    .record(z.string().min(1), z.string().nullable())
+    .refine((map) => Object.keys(map).length > 0, "Provide at least one secret")
+    .describe(
+      "Map of secret name -> value. A string creates or updates a secret_text binding, null deletes it, and names not listed are left unchanged. All changes land in ONE new version that is deployed immediately."
+    ),
+});
+
+const DeleteSecretSchema = z.object({
+  script_name: z.string().describe("The name of the Worker script"),
+  name: z.string().min(1).describe("Name of the secret binding to delete"),
+});
+
+const TailWorkerSchema = z.object({
+  script_name: z.string().describe("The Worker to tail"),
+  duration_seconds: z
+    .number()
+    .int()
+    .min(1)
+    .max(50)
+    .optional()
+    .default(15)
+    .describe("How long to listen, in seconds (default 15, max 50 to stay inside client request timeouts)"),
+  max_events: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe("Stop early after this many matching events (default 50)"),
+  errors_only: z
+    .boolean()
+    .optional()
+    .describe("Only keep events whose outcome is not ok or that threw an exception"),
+  search: z
+    .string()
+    .optional()
+    .describe("Case-insensitive substring matched against log lines, exceptions and request URLs"),
+  trigger_url: z
+    .string()
+    .url()
+    .regex(/^https:\/\//, "trigger_url must be an https URL")
+    .optional()
+    .describe(
+      "Optional https URL to GET once the tail is connected (e.g. the Worker route you are debugging) so the request is captured in this same call"
+    ),
+});
+
 const QueryWorkerLogsSchema = z.object({
   script_name: z.string().describe("The Worker whose logs to query"),
   minutes: z
@@ -414,10 +529,12 @@ function fail(error: unknown): CallToolResult {
 
 // ==================== Server ====================
 
-async function main() {
-  const config = loadConfig();
-  const workers = new WorkersClient(config.apiToken, config.accountId);
-
+/**
+ * Build one McpServer with every tool registered. serveStdio() calls this
+ * factory once per connection; the WorkersClient (and its rate limiter) is
+ * shared, so it is constructed once in main() and passed in.
+ */
+function buildServer(workers: WorkersClient): McpServer {
   // The tools capability is auto-registered by registerTool.
   const server = new McpServer({ name: "cloudflare-workers", version: SERVER_VERSION });
 
@@ -435,19 +552,18 @@ async function main() {
       inputSchema: S;
       annotations?: ToolAnnotations;
     },
-    handler: (args: z.infer<S>) => Promise<CallToolResult>
+    handler: (args: z.infer<S>, ctx: ServerContext) => Promise<CallToolResult>
   ): void {
     // ToolCallback<S> is a conditional type that TypeScript cannot reduce for
     // an unresolved generic S, so the wrapper needs one cast to the SDK's own
     // callback type; args is the schema's already-validated output.
-    const wrapped = (async (args: z.infer<S>): Promise<CallToolResult> => {
+    const wrapped = (async (args: z.infer<S>, ctx: ServerContext): Promise<CallToolResult> => {
       try {
-        return await handler(args);
+        return await handler(args, ctx);
       } catch (error) {
         return fail(error);
       }
     }) as ToolCallback<S>;
-
     server.registerTool(
       name,
       {
@@ -1240,6 +1356,274 @@ async function main() {
     }
   );
 
+  // ========== Worker Preview Tools (beta, new Workers API) ==========
+
+  /** Find a preview by id, slug or name; undefined if none matches. */
+  async function findPreview(scriptName: string, ref: string): Promise<WorkerPreview | undefined> {
+    const response = await workers.listPreviews(scriptName, { per_page: 100 });
+    return (response.result ?? []).find((p) => p.id === ref || p.slug === ref || p.name === ref);
+  }
+
+  function summarizePreview(preview: WorkerPreview) {
+    return {
+      id: preview.id,
+      name: preview.name,
+      slug: preview.slug,
+      url: preview.urls?.[0],
+      deployed_on: preview.deployed_on ?? undefined,
+    };
+  }
+
+  addTool(
+    "deploy_preview",
+    {
+      title: "Deploy Preview",
+      description:
+        "Deploy a preview of an existing Worker without touching production: either a static-site directory (assets) or Worker code (modules). Returns a stable per-preview URL (https://<slug>-<worker>.<account>.workers.dev) and a per-deployment URL. Re-deploying the same preview_name updates that preview. Uses the beta Worker Previews API.",
+      inputSchema: DeployPreviewSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const existing = await getExistingSettings(input.script_name);
+      if (existing === null) {
+        throw new Error(
+          `Worker ${input.script_name} doesn't exist. Previews attach to an existing Worker, so deploy production first (deploy_static_site or deploy_worker).`
+        );
+      }
+
+      const body: PreviewDeploymentBody = {
+        compatibility_date: input.compatibility_date ?? existing.compatibility_date ?? todayISO(),
+        ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
+      };
+      let files: { files_total: number; files_uploaded: number; files_reused: number } | undefined;
+
+      if (input.directory !== undefined) {
+        const collected = await collectAssets(input.directory);
+        const upload = await uploadAssets(workers, input.script_name, collected.files);
+        const config: AssetsConfig = {
+          ...(input.html_handling && { html_handling: input.html_handling }),
+          ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
+          ...(collected.headers !== undefined && { _headers: collected.headers }),
+          ...(collected.redirects !== undefined && { _redirects: collected.redirects }),
+        };
+        body.assets = { jwt: upload.completionJwt, ...(Object.keys(config).length > 0 && { config }) };
+        files = {
+          files_total: collected.files.length,
+          files_uploaded: upload.uploaded,
+          files_reused: upload.skipped,
+        };
+      } else {
+        const modules = input.modules!;
+        body.main_module = input.main_module ?? modules[0].name;
+        body.modules = modules.map((mod) => ({
+          name: mod.name,
+          content_type: mod.content_type ?? "application/javascript+module",
+          content_base64: Buffer.from(mod.content, "utf8").toString("base64"),
+        }));
+        if (input.bindings) body.bindings = input.bindings;
+      }
+
+      let note: string | undefined;
+      if (input.enable_preview_urls !== false) {
+        const sub = await workers.getScriptSubdomain(input.script_name);
+        if (!sub.result?.previews_enabled) {
+          await workers.setScriptSubdomain(input.script_name, sub.result?.enabled ?? false, true);
+          note = "Enabled preview URLs for this Worker (production workers.dev setting unchanged).";
+        }
+      }
+
+      const preview =
+        (await findPreview(input.script_name, input.preview_name)) ??
+        (await workers.createPreview(input.script_name, input.preview_name)).result;
+      const deployment = (
+        await workers.createPreviewDeployment(input.script_name, preview.id, body)
+      ).result;
+      // Re-read so the stable URL reflects a just-enabled previews setting.
+      const fresh = (await workers.getPreview(input.script_name, preview.id)).result ?? preview;
+      const previewUrl = fresh.urls?.[0];
+      if (!previewUrl && !deployment.urls?.length) {
+        note =
+          "Deployed, but no preview URL is routable. Enable preview URLs with set_workers_dev (previews_enabled: true).";
+      }
+
+      return ok(
+        {
+          script_name: input.script_name,
+          preview: summarizePreview(fresh),
+          deployment: { id: deployment.id, url: deployment.urls?.[0] },
+          ...(files ?? {}),
+          note,
+        },
+        `Deployed preview "${fresh.name}" of ${input.script_name}` + (previewUrl ? ` at ${previewUrl}` : "")
+      );
+    }
+  );
+
+  addTool(
+    "list_previews",
+    {
+      title: "List Previews",
+      description: "List a Worker's previews with their stable URLs (beta Worker Previews API).",
+      inputSchema: ListPreviewsSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.listPreviews(input.script_name, { per_page: 100 });
+      const previews = (response.result ?? []).map(summarizePreview);
+      return ok(
+        { script_name: input.script_name, previews },
+        `${previews.length} preview(s) on ${input.script_name}`
+      );
+    }
+  );
+
+  addTool(
+    "delete_preview",
+    {
+      title: "Delete Preview",
+      description:
+        "Delete a Worker preview and its deployments, by name, slug or id. Production is unaffected.",
+      inputSchema: DeletePreviewSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      const preview = await findPreview(input.script_name, input.preview);
+      if (!preview) {
+        throw new Error(
+          `No preview "${input.preview}" on ${input.script_name}. Use list_previews to see valid names.`
+        );
+      }
+      await workers.deletePreview(input.script_name, preview.id);
+      return ok(
+        { script_name: input.script_name, deleted: summarizePreview(preview) },
+        `Deleted preview "${preview.name}" from ${input.script_name}`
+      );
+    }
+  );
+
+  // ========== Secrets Tools ==========
+
+  addTool(
+    "list_secrets",
+    {
+      title: "List Secrets",
+      description:
+        "List the secret bindings on a Worker (names and types only; Cloudflare never returns secret values).",
+      inputSchema: ListSecretsSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      const response = await workers.listSecrets(input.script_name);
+      const secrets = (response.result ?? []).map((s) => ({ name: s.name, type: s.type }));
+      return ok(
+        { script_name: input.script_name, secrets },
+        `${secrets.length} secret(s) on ${input.script_name}`
+      );
+    }
+  );
+
+  addTool(
+    "set_secrets",
+    {
+      title: "Set Secrets",
+      description:
+        "Create, update or delete secrets on a Worker without touching its code or other bindings. All changes land in ONE new version, deployed immediately. Pass a string to set a secret and null to delete it. Values are never echoed back. Secret values pass through the conversation, so for highly sensitive values prefer `wrangler secret put`.",
+      inputSchema: SetSecretsSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      await workers.patchSecrets(input.script_name, input.secrets);
+      const names = Object.keys(input.secrets);
+      const set = names.filter((name) => input.secrets[name] !== null);
+      const deleted = names.filter((name) => input.secrets[name] === null);
+      return ok(
+        { script_name: input.script_name, set, deleted },
+        `Updated secrets on ${input.script_name} (${set.length} set, ${deleted.length} deleted) in one new deployed version`
+      );
+    }
+  );
+
+  addTool(
+    "delete_secret",
+    {
+      title: "Delete Secret",
+      description:
+        "Delete one secret binding from a Worker. This creates and deploys a new version without the secret, so code reading it will see undefined.",
+      inputSchema: DeleteSecretSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (input) => {
+      await workers.deleteSecret(input.script_name, input.name);
+      return ok(
+        { script_name: input.script_name, deleted: input.name },
+        `Deleted secret ${input.name} from ${input.script_name}`
+      );
+    }
+  );
+
+  // ========== Live Tail ==========
+
+  addTool(
+    "tail_worker",
+    {
+      title: "Tail Worker",
+      description:
+        "Live-tail a Worker for a short window, like `wrangler tail`: returns requests, console logs, exceptions and outcomes as they happen. Works on any Worker; observability doesn't need to be enabled. Only traffic during the window is captured, so pass trigger_url to send a request once connected. For historical logs use query_worker_logs.",
+      inputSchema: TailWorkerSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (input, ctx) => {
+      const tail = await workers.createTail(input.script_name);
+      let trigger: { url: string; status?: number; error?: string } | undefined;
+      try {
+        const result = await collectTail({
+          url: tail.result.url,
+          durationMs: input.duration_seconds * 1000,
+          maxEvents: input.max_events,
+          errorsOnly: input.errors_only,
+          search: input.search,
+          signal: ctx.mcpReq.signal,
+          onOpen: input.trigger_url
+            ? () => {
+                const record: { url: string; status?: number; error?: string } = {
+                  url: input.trigger_url!,
+                };
+                trigger = record;
+                // Fire-and-forget; the tail captures the outcome. Redirects are
+                // not followed so the request never leaves the given host.
+                void fetch(record.url, { redirect: "manual", signal: AbortSignal.timeout(20000) })
+                  .then((response) => {
+                    record.status = response.status;
+                  })
+                  .catch((error: unknown) => {
+                    record.error = error instanceof Error ? error.message : String(error);
+                  });
+              }
+            : undefined,
+        });
+        const events = result.events.map(summarizeTailEvent);
+        return ok(
+          {
+            script_name: input.script_name,
+            listened_seconds: input.duration_seconds,
+            stop_reason: result.stopReason,
+            captured: events.length,
+            filtered_out: result.filtered,
+            ...(trigger && { trigger }),
+            events,
+          },
+          `Captured ${events.length} event(s) from ${input.script_name}` +
+            (events.length === 0
+              ? " (nothing hit the Worker during the window; pass trigger_url or send traffic while tailing)"
+              : "")
+        );
+      } finally {
+        // Delete eagerly so tails don't pile up against the per-Worker limit.
+        await workers.deleteTail(input.script_name, tail.result.id).catch(() => undefined);
+      }
+    }
+  );
+
   // ========== Utility Tools ==========
 
   addNoArgTool(
@@ -1265,9 +1649,25 @@ async function main() {
     }
   );
 
-  // Connect via stdio transport.
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
+}
+
+// ==================== Entry ====================
+
+async function main() {
+  const config = loadConfig();
+  const workers = new WorkersClient(config.apiToken, config.accountId);
+
+  // serveStdio (SDK v2) negotiates the protocol era per connection: it serves
+  // 2026-07-28 clients (server/discover) and 2025-era clients (initialize)
+  // from the same factory. A bare server.connect(new StdioServerTransport())
+  // would only ever speak the 2025 protocol.
+  const handle = serveStdio(() => buildServer(workers));
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      void handle.close().finally(() => process.exit(0));
+    });
+  }
 
   // Log to stderr (stdout is reserved for the MCP protocol).
   console.error(`Cloudflare Workers MCP Server v${SERVER_VERSION} started`);

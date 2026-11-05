@@ -262,10 +262,17 @@ advertised tool set), `test/integration` (guarded live e2e). See `test/README.md
 - **TypeScript 7** (Go compiler): `tsc --noEmit` works; **no programmatic
   compiler API until 7.1**, so tsup `--dts` crashes — build stays
   `tsup src/index.ts --format esm --clean`, no declarations (bin-only package).
-- **MCP SDK**: never below **1.32.2** (raised from 1.29.0 on 2026-11-05 for
-  the Oct 2026 GHSAs patched in 1.30.1–1.32.0). **SDK v2** landed ~2026-07-28 under new package names
-  (`@modelcontextprotocol/server`), ESM-only, Standard Schema — plan the
-  migration late 2026 / early 2027; v1.x gets security fixes ~6 months.
+- **MCP SDK v2** (migrated 2026-11-05, from v1 1.32.2): `@modelcontextprotocol/server`
+  (runtime) and `@modelcontextprotocol/client` (tests only). The codemod
+  (`npx @modelcontextprotocol/codemod v1-to-v2 .`) did only the imports.
+  The manual changes:
+  - Entry point is now `serveStdio(() => buildServer(workers))`, which serves
+    both the 2025 and 2026-07-28 protocol eras.
+  - Tests no longer match `-32602` in rendered text, because v2 dropped the
+    `MCP error <code>:` prefix. They match `Input validation error`.
+  - Unknown tools now reject with a protocol error instead of resolving
+    `isError`.
+  - zod must be ≥ 4.2.
 - **`@types/node` stays ^22** to match `engines.node >=22` — bumping it lets
   Node-26-only APIs pass typecheck but crash on supported LTS.
 
@@ -287,3 +294,86 @@ Added 2026-11-05:
 - `assets.base_path` (2026-10-28): developers.cloudflare.com/changelog/post/2026-10-28-static-assets-base-path/ and developers.cloudflare.com/workers/static-assets/routing/advanced/serving-a-subdirectory/
 - `nodejs_compat` default for compat dates ≥ 2026-08-04: developers.cloudflare.com/changelog/post/2026-08-04-nodejs-compat-default/
 - API deprecations page (lists only KV legacy routes as of 2026-11-05): developers.cloudflare.com/fundamentals/api/reference/deprecations/
+
+## 10. Post-v1 additions & the Workers API migration plan (2026-11-05)
+
+### New tools: protocol facts, all verified live 2026-11-05
+- **Secrets** (`list_secrets`, `set_secrets`, `delete_secret`). These are GA
+  scripts-path endpoints: `GET /scripts/{n}/secrets`,
+  `PATCH /scripts/{n}/secrets-bulk` and `DELETE /scripts/{n}/secrets/{name}`.
+  - The bulk patch is a JSON Merge Patch, `{secrets: {NAME: {type: "secret_text", text} | null}}`.
+    `null` deletes, and the whole patch produces ONE version that is
+    **deployed immediately**.
+  - Reads return only `{name, type}`.
+  - Deleting a missing secret returns error 10056.
+- **Live tail** (`tail_worker`) uses the classic `POST /scripts/{n}/tails`
+  (GA), which returns `{id, url, expires_at}`.
+  - Open a WebSocket to `url` with subprotocol `trace-v1` and send
+    `{"debug":false}`. Each frame is one JSON event: `outcome`,
+    `eventTimestamp`, `logs[{message[], level}]`, `exceptions[{name, message}]`,
+    `event.request{url, method, headers, cf}` and `event.response.status`.
+  - Delete the tail afterwards with `DELETE /tails/{id}`.
+  - This works on any Worker, with no observability needed. We filter
+    client-side because the server-side filter vocabulary is undocumented.
+  - The observability `POST /observability/telemetry/live-tail` alternative
+    needs a heartbeat loop and an undocumented `scriptId`, so it isn't used.
+- **Worker Previews** (`deploy_preview`, `list_previews`, `delete_preview`)
+  are beta and exist only on `/workers/workers/{name}/previews`.
+  - `POST` with `{name}` creates a preview.
+  - `POST /previews/{id}/deployments` takes a JSON body with base64
+    `modules` or `assets{jwt, config}`. The JWT from the normal scripts-path
+    upload session works, and `config._headers` applies.
+  - **URLs are only routable when the Worker's subdomain has
+    `previews_enabled`**: the stable `https://<slug>-<worker>.<acct>.workers.dev`,
+    and per deployment `https://<id8>-…`. Production deployments are never
+    touched.
+
+### Migrating off the deprecated legacy endpoints: assessment
+**Effort: moderate, about 2–3 focused days.** 11 of the 24 `WorkersClient`
+methods change, and 13 stay on GA scripts-path endpoints: deployments (and
+so rollback), schedules, domains, account subdomain, asset upload, telemetry,
+secrets and tails.
+
+Facts that make it tractable:
+- The new API accepts the Worker **name** as `{worker_id}` [verified live].
+- Legacy-created Workers are addressable there [verified live].
+- Pairing new-API version creation with the legacy `/deployments` endpoint
+  is the documented pattern [docs].
+
+Method mapping:
+
+| Method | Replacement |
+| --- | --- |
+| `listWorkers` | `GET /workers/workers`. Paginated, and drops `has_assets`/`usage_model`. |
+| `getWorkerSettings` | `GET /workers/workers/{n}` (logpush, observability, subdomain, tags) **plus** the deployed version (bindings, compat, placement, assets config). Find the deployed version via `/deployments`, **never** `latest`, which means "newest created". |
+| `downloadWorkerCode` | `GET …/versions/{id}?include=modules`. Base64 JSON, so the multipart parser goes away. |
+| `uploadScript` | Ensure the Worker exists (`POST /workers/workers`), then `POST …/versions?deploy=true` with base64 modules and `assets.jwt`. Per [docs], `_headers`/`_redirects` become `text/plain` modules on versions. |
+| `patchWorkerSettings` | `PATCH /workers/workers/{n}` **plus** `PATCH …/versions/latest?deploy=true`. Two calls, so no longer atomic. |
+| `deleteWorker`, script subdomain, `list/get/createVersion` | Same-shaped new endpoints. |
+
+Blockers and risks:
+1. **The new API has no `keep_assets`**. `PATCH …/versions/latest` inherits
+   omitted fields, but whether that includes assets is unverified, and it's
+   tied to `latest`. Keep `redeploy_assets` and keep_assets code deploys on
+   legacy `PUT /scripts` until there's an equivalent.
+2. **Assets-only versions** (zero modules) and `_headers`-as-module on
+   production versions are unverified. Test these live first. (Previews do
+   work assets-only, see above.)
+3. **`get_worker_code` for old service-worker-syntax Workers** is unknown on
+   the new API.
+4. **Deploying staged code by accident** if anything resolves `latest`
+   instead of the deployed version.
+5. **Base64 makes uploads about 33% larger.**
+
+Staging, each stage shippable on its own:
+1. Reads: list, get, versions, code download, subdomain.
+2. `deleteWorker` and `setScriptSubdomain`.
+3. `createVersion` with a shared `toVersionBody()`/`ensureWorker()`.
+4. `deploy_worker`, then `deploy_static_site`.
+5. `update_worker_settings`/`redeploy_assets` last. Keep these two on
+   legacy if blocker 1 still holds.
+
+Extend the guarded live test at each stage: a `_headers` rule served,
+`get_worker_code` round-trip, and a legacy-created Worker redeployed via the
+new paths. Re-check Cloudflare's API deprecations page before each release;
+as of 2026-11-05 nothing forces the move.

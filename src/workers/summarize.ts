@@ -4,6 +4,7 @@
  */
 
 import type {
+  TailEvent,
   TelemetryEvent,
   WorkerDeployment,
   WorkerDomain,
@@ -134,4 +135,67 @@ export function summarizeLogEvent(event: TelemetryEvent): LogEventSummary {
   return Object.fromEntries(
     Object.entries(summary).filter(([, value]) => value !== undefined)
   ) as LogEventSummary;
+}
+
+export interface TailEventSummary {
+  timestamp?: string;
+  outcome?: string;
+  /** "GET /path?query" for fetch events, "cron <expr>" for scheduled ones. */
+  request?: string;
+  status?: number;
+  logs?: string[];
+  exceptions?: string[];
+  cpu_ms?: number;
+  wall_ms?: number;
+  version_id?: string;
+  truncated?: boolean;
+}
+
+/** Render a log line's message parts the way console.log would join them. */
+function renderLogMessage(parts: unknown[] | undefined): string {
+  return (parts ?? [])
+    .map((part) => (typeof part === "string" ? part : JSON.stringify(part)))
+    .join(" ");
+}
+
+/**
+ * Compact a trace-v1 tail event. Request headers and `cf` metadata are
+ * deliberately dropped — they can carry cookies, auth headers and client IPs.
+ */
+export function summarizeTailEvent(event: TailEvent): TailEventSummary {
+  const request = event.event?.request;
+  let requestLine: string | undefined;
+  if (request?.url) {
+    let path = request.url;
+    try {
+      const parsed = new URL(request.url);
+      path = parsed.pathname + parsed.search;
+    } catch {
+      // Not an absolute URL — keep it verbatim.
+    }
+    requestLine = [request.method, path].filter(Boolean).join(" ");
+  } else if (typeof event.event?.cron === "string") {
+    requestLine = `cron ${event.event.cron}`;
+  }
+
+  const summary: TailEventSummary = {
+    timestamp:
+      event.eventTimestamp !== undefined ? new Date(event.eventTimestamp).toISOString() : undefined,
+    outcome: event.outcome,
+    request: requestLine,
+    status: event.event?.response?.status,
+    logs: event.logs?.length
+      ? event.logs.map((log) => `[${log.level ?? "log"}] ${renderLogMessage(log.message)}`)
+      : undefined,
+    exceptions: event.exceptions?.length
+      ? event.exceptions.map((e) => `${e.name ?? "Error"}: ${e.message ?? ""}`.trim())
+      : undefined,
+    cpu_ms: event.cpuTime,
+    wall_ms: event.wallTime,
+    version_id: event.scriptVersion?.id,
+    truncated: event.truncated || undefined,
+  };
+  return Object.fromEntries(
+    Object.entries(summary).filter(([, value]) => value !== undefined)
+  ) as TailEventSummary;
 }

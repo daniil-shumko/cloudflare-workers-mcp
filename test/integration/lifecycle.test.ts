@@ -15,9 +15,8 @@ import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
 import { WorkersClient } from "../../src/workers/client.js";
 
 const LIVE =
@@ -78,8 +77,8 @@ test(
   "live static-site lifecycle: deploy → serve → dedupe redeploy → delete",
   {
     skip: LIVE ? false : "set CF_LIVE_TEST=1 and CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID to run",
-    // Must exceed the sum of the three 180 s serve-polls plus deploy overhead.
-    timeout: 720000,
+    // Generous: the sum of every serve-poll window (180/120 s each) plus deploy overhead.
+    timeout: 1500000,
   },
   async () => {
     const scriptName = `cf-mcp-test-${Date.now().toString(36)}`;
@@ -197,8 +196,12 @@ test(
         modules: [
           {
             name: "index.js",
-            content:
-              "export default { fetch() { return new Response('hello from cf-mcp-test worker'); } }",
+            content: [
+              "export default { fetch(req, env) {",
+              "  console.log('cf-mcp-test log', new URL(req.url).pathname);",
+              "  return new Response('hello from cf-mcp-test worker secret=' + (env.LIVE_SECRET ?? 'none'));",
+              "} }",
+            ].join("\n"),
           },
         ],
       });
@@ -211,6 +214,78 @@ test(
       assert.ok(workerUrl, "expected a workers.dev URL for the module Worker");
       const workerBody = await fetchUntilOk(workerUrl, 180000);
       assert.match(workerBody, /hello from cf-mcp-test worker/);
+
+      // ---- secrets: set in one deployed version, readable by the Worker, never echoed ----
+      const setSecrets = await call("set_secrets", {
+        script_name: workerName,
+        secrets: { LIVE_SECRET: "v1-live" },
+      });
+      assert.equal(setSecrets.isError, false, `set_secrets failed: ${JSON.stringify(setSecrets.payload)}`);
+      assert.ok(!JSON.stringify(setSecrets.payload).includes("v1-live"), "secret values are never echoed");
+      const listed = await call("list_secrets", { script_name: workerName });
+      assert.deepEqual(
+        (listed.payload.data?.secrets as Array<{ name: string }>).map((s) => s.name),
+        ["LIVE_SECRET"]
+      );
+      await fetchUntilBody(workerUrl, /secret=v1-live/, 120000);
+
+      // ---- tail_worker: trigger_url's request and its console.log are captured ----
+      const tail = await call("tail_worker", {
+        script_name: workerName,
+        duration_seconds: 20,
+        max_events: 1,
+        search: "tail-check",
+        trigger_url: new URL("/tail-check", workerUrl).toString(),
+      });
+      assert.equal(tail.isError, false, `tail_worker failed: ${JSON.stringify(tail.payload)}`);
+      const tailed = tail.payload.data?.events as Array<{ request?: string; logs?: string[] }>;
+      assert.equal(tailed.length, 1, `expected the triggered request: ${JSON.stringify(tail.payload.data)}`);
+      assert.match(tailed[0].request ?? "", /GET \/tail-check/);
+      assert.match((tailed[0].logs ?? []).join("\n"), /cf-mcp-test log \/tail-check/);
+
+      const delSecret = await call("delete_secret", { script_name: workerName, name: "LIVE_SECRET" });
+      assert.equal(delSecret.isError, false, `delete_secret failed: ${JSON.stringify(delSecret.payload)}`);
+      const afterDelete = await call("list_secrets", { script_name: workerName });
+      assert.deepEqual(afterDelete.payload.data?.secrets, []);
+
+      // ---- previews (beta): code preview serves while production is untouched ----
+      const codePreview = await call("deploy_preview", {
+        script_name: workerName,
+        preview_name: "live-check",
+        modules: [
+          { name: "index.js", content: "export default { fetch() { return new Response('cf-mcp-test preview build'); } }" },
+        ],
+      });
+      assert.equal(codePreview.isError, false, `deploy_preview failed: ${JSON.stringify(codePreview.payload)}`);
+      const codePreviewUrl = (codePreview.payload.data?.preview as { url?: string }).url;
+      assert.ok(codePreviewUrl, `expected a stable preview URL: ${JSON.stringify(codePreview.payload.data)}`);
+      await fetchUntilBody(codePreviewUrl, /cf-mcp-test preview build/, 120000);
+      assert.match(await (await fetch(workerUrl)).text(), /hello from cf-mcp-test worker/, "production unchanged");
+
+      // Static-site preview: assets plus the _headers rule must apply.
+      const sitePreview = await call("deploy_preview", {
+        script_name: scriptName,
+        preview_name: "site-check",
+        directory: siteDir,
+        not_found_handling: "404-page",
+      });
+      assert.equal(sitePreview.isError, false, `site deploy_preview failed: ${JSON.stringify(sitePreview.payload)}`);
+      const sitePreviewUrl = (sitePreview.payload.data?.preview as { url?: string }).url;
+      assert.ok(sitePreviewUrl, "expected a stable site preview URL");
+      await fetchUntilBody(sitePreviewUrl, new RegExp(scriptName), 120000);
+      assert.equal(
+        (await fetch(sitePreviewUrl)).headers.get("x-cf-mcp-test"),
+        "1",
+        "the _headers rule should apply on the preview"
+      );
+
+      const previews = await call("list_previews", { script_name: workerName });
+      assert.ok(
+        (previews.payload.data?.previews as Array<{ name: string }>).some((p) => p.name === "live-check"),
+        "list_previews should include the preview"
+      );
+      const delPreview = await call("delete_preview", { script_name: workerName, preview: "live-check" });
+      assert.equal(delPreview.isError, false, `delete_preview failed: ${JSON.stringify(delPreview.payload)}`);
 
       // Delete both through the tool and unmark cleanup.
       for (const name of [workerName, scriptName]) {
