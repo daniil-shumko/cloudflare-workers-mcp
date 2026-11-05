@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-workers-mcp",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "MCP server for managing Cloudflare Workers: deploy static sites and Worker scripts, manage versions, deployments, custom domains, and cron triggers",
   "type": "module",
   "main": "dist/index.js",
