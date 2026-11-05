@@ -262,10 +262,17 @@ advertised tool set), `test/integration` (guarded live e2e). See `test/README.md
 - **TypeScript 7** (Go compiler): `tsc --noEmit` works; **no programmatic
   compiler API until 7.1**, so tsup `--dts` crashes — build stays
   `tsup src/index.ts --format esm --clean`, no declarations (bin-only package).
-- **MCP SDK**: never below **1.32.2** (raised from 1.29.0 on 2026-11-05 for
-  the Oct 2026 GHSAs patched in 1.30.1–1.32.0). **SDK v2** landed ~2026-07-28 under new package names
-  (`@modelcontextprotocol/server`), ESM-only, Standard Schema — plan the
-  migration late 2026 / early 2027; v1.x gets security fixes ~6 months.
+- **MCP SDK v2** (migrated 2026-11-05, from v1 1.32.2): `@modelcontextprotocol/server`
+  (runtime) and `@modelcontextprotocol/client` (tests only). The codemod
+  (`npx @modelcontextprotocol/codemod v1-to-v2 .`) did only the imports.
+  The manual changes:
+  - Entry point is now `serveStdio(() => buildServer(workers))`, which serves
+    both the 2025 and 2026-07-28 protocol eras.
+  - Tests no longer match `-32602` in rendered text, because v2 dropped the
+    `MCP error <code>:` prefix. They match `Input validation error`.
+  - Unknown tools now reject with a protocol error instead of resolving
+    `isError`.
+  - zod must be ≥ 4.2.
 - **`@types/node` stays ^22** to match `engines.node >=22` — bumping it lets
   Node-26-only APIs pass typecheck but crash on supported LTS.
 

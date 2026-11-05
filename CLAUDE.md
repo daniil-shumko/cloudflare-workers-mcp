@@ -77,8 +77,11 @@ src/
 
 ### Key Patterns
 
-**Tool Structure**: All MCP tools are registered in `src/index.ts` via the
-high-level `McpServer` + `registerTool` API. Each tool has a single source of
+**Tool Structure**: All MCP tools are registered in `src/index.ts` inside
+`buildServer()` via the high-level `McpServer` + `registerTool` API (SDK v2).
+`serveStdio` calls `buildServer()` once per connection, so it must stay
+synchronous and side-effect free. The `WorkersClient` is built once in
+`main()` and shared. Each tool has a single source of
 truth — one Zod schema — wired up through the local `addTool(name, config, handler)`
 helper, which:
 - passes the Zod schema to `registerTool` (the SDK generates the advertised
@@ -120,9 +123,15 @@ protocol, and the milestone plan live in `IMPLEMENTATION_PLAN.md`.
 - **No `--dts` in the build**: TypeScript 7's Go compiler has no programmatic
   API until 7.1, so tsup's dts step crashes. This is a bin-only package; it
   ships no declarations on purpose.
-- **`@modelcontextprotocol/sdk` must stay ≥ 1.32.2** (security patches; the
-  Oct 2026 GHSAs fixed in 1.30.1–1.32.0). SDK v2 (`@modelcontextprotocol/server`,
-  2.4.0 as of 2026-11-05) is a planned, deliberate migration — v1.x security
-  support is expected to end ~early 2027 — don't do it ad hoc.
+- **MCP SDK v2** (since 2026-11-05): runtime dep `@modelcontextprotocol/server`,
+  dev-only `@modelcontextprotocol/client` (tests). Don't reintroduce the v1
+  `@modelcontextprotocol/sdk` package. The entry point is
+  `serveStdio(() => buildServer(workers))`. Don't replace it with
+  `server.connect(new StdioServerTransport())`, which only speaks the
+  2025-era protocol. `serveStdio` serves both 2025 (`initialize`) and
+  2026-07-28 (`server/discover`) clients, and the protocol smoke test covers
+  both eras.
+- **zod stays ≥ 4.2** (SDK v2 converts schemas via zod's `~standard.jsonSchema`;
+  older zod silently drops `.describe()` text from advertised schemas).
 - **`@types/node` stays ^22** to match `engines.node >=22`; bumping it would
   let Node-26-only APIs slip past typecheck and crash on supported LTS.

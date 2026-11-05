@@ -13,9 +13,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/server";
+import type { ToolCallback, CallToolResult, ToolAnnotations } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import { CloudflareAPIError, WorkersClient } from "./workers/client.js";
@@ -414,10 +414,12 @@ function fail(error: unknown): CallToolResult {
 
 // ==================== Server ====================
 
-async function main() {
-  const config = loadConfig();
-  const workers = new WorkersClient(config.apiToken, config.accountId);
-
+/**
+ * Build one McpServer with every tool registered. serveStdio() calls this
+ * factory once per connection; the WorkersClient (and its rate limiter) is
+ * shared, so it is constructed once in main() and passed in.
+ */
+function buildServer(workers: WorkersClient): McpServer {
   // The tools capability is auto-registered by registerTool.
   const server = new McpServer({ name: "cloudflare-workers", version: SERVER_VERSION });
 
@@ -447,7 +449,6 @@ async function main() {
         return fail(error);
       }
     }) as ToolCallback<S>;
-
     server.registerTool(
       name,
       {
@@ -1265,9 +1266,25 @@ async function main() {
     }
   );
 
-  // Connect via stdio transport.
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
+}
+
+// ==================== Entry ====================
+
+async function main() {
+  const config = loadConfig();
+  const workers = new WorkersClient(config.apiToken, config.accountId);
+
+  // serveStdio (SDK v2) negotiates the protocol era per connection: it serves
+  // 2026-07-28 clients (server/discover) and 2025-era clients (initialize)
+  // from the same factory. A bare server.connect(new StdioServerTransport())
+  // would only ever speak the 2025 protocol.
+  const handle = serveStdio(() => buildServer(workers));
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      void handle.close().finally(() => process.exit(0));
+    });
+  }
 
   // Log to stderr (stdout is reserved for the MCP protocol).
   console.error(`Cloudflare Workers MCP Server v${SERVER_VERSION} started`);
