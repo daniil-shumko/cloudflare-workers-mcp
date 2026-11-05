@@ -119,8 +119,9 @@ protocol, and the milestone plan live in `IMPLEMENTATION_PLAN.md`.
 - **No `--dts` in the build**: TypeScript 7's Go compiler has no programmatic
   API until 7.1, so tsup's dts step crashes. This is a bin-only package; it
   ships no declarations on purpose.
-- **`@modelcontextprotocol/sdk` must stay ≥ 1.29.0** (security patches). SDK
-  v2 (new package names, ~2026-07-28) is a planned migration for late 2026 —
-  don't do it ad hoc.
+- **`@modelcontextprotocol/sdk` must stay ≥ 1.32.2** (security patches; the
+  Oct 2026 GHSAs fixed in 1.30.1–1.32.0). SDK v2 (`@modelcontextprotocol/server`,
+  2.4.0 as of 2026-11-05) is a planned, deliberate migration — v1.x security
+  support is expected to end ~early 2027 — don't do it ad hoc.
 - **`@types/node` stays ^22** to match `engines.node >=22`; bumping it would
   let Node-26-only APIs slip past typecheck and crash on supported LTS.

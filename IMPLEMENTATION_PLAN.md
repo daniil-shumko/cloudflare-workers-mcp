@@ -238,8 +238,8 @@ advertised tool set), `test/integration` (guarded live e2e). See `test/README.md
 - **TypeScript 7** (Go compiler): `tsc --noEmit` works; **no programmatic
   compiler API until 7.1**, so tsup `--dts` crashes — build stays
   `tsup src/index.ts --format esm --clean`, no declarations (bin-only package).
-- **MCP SDK**: never below **1.29.0** (three 2025–26 high-severity GHSA
-  patches). **SDK v2** lands ~2026-07-28 under new package names
+- **MCP SDK**: never below **1.32.2** (raised from 1.29.0 on 2026-11-05 for
+  the Oct 2026 GHSAs patched in 1.30.1–1.32.0). **SDK v2** landed ~2026-07-28 under new package names
   (`@modelcontextprotocol/server`), ESM-only, Standard Schema — plan the
   migration late 2026 / early 2027; v1.x gets security fixes ~6 months.
 - **`@types/node` stays ^22** to match `engines.node >=22` — bumping it lets
