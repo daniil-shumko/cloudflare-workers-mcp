@@ -93,6 +93,44 @@ test("MCP protocol smoke test over stdio (no real creds)", { timeout: 30000 }, a
       "validation error should surface the -32602 invalid-params code"
     );
 
+    // ---- base_path must be a '/'-rooted prefix; validated before the handler ----
+    const badBasePath = await client.callTool({
+      name: "deploy_static_site",
+      arguments: { script_name: "x", directory: ".", base_path: "blog" },
+    });
+    assert.equal(badBasePath.isError, true, "base_path without a leading '/' should be rejected");
+    assert.match(
+      textOf(badBasePath as { content?: Array<{ type: string; text?: string }> }),
+      /-32602/,
+      "base_path validation should surface the -32602 invalid-params code"
+    );
+
+    // ---- redeploy_assets is strict: asset config can't ride on keep_assets
+    // (the API silently ignores it), so stale callers must fail loudly ----
+    const staleRedeploy = await client.callTool({
+      name: "redeploy_assets",
+      arguments: { script_name: "x", not_found_handling: "404-page" },
+    });
+    assert.equal(staleRedeploy.isError, true, "redeploy_assets should reject asset-config inputs");
+    assert.match(
+      textOf(staleRedeploy as { content?: Array<{ type: string; text?: string }> }),
+      /-32602/,
+      "unknown redeploy_assets keys should surface the -32602 invalid-params code"
+    );
+
+    // ---- newer optional inputs are advertised ----
+    const propsOf = (name: string) =>
+      Object.keys(
+        (tools.find((t) => t.name === name)?.inputSchema?.properties ?? {}) as Record<string, unknown>
+      );
+    assert.ok(propsOf("deploy_static_site").includes("base_path"), "deploy_static_site advertises base_path");
+    assert.deepEqual(
+      propsOf("redeploy_assets").sort(),
+      ["compatibility_date", "script_name"],
+      "redeploy_assets advertises no asset-config inputs"
+    );
+    assert.ok(propsOf("query_worker_logs").includes("cursor"), "query_worker_logs advertises cursor");
+
     // ---- health_check never crashes; a bogus/unreachable token yields token_valid:false ----
     const health = await client.callTool({ name: "health_check", arguments: {} });
     const healthText = textOf(health as { content?: Array<{ type: string; text?: string }> });

@@ -168,6 +168,8 @@ export interface AssetsConfig {
   html_handling?: "auto-trailing-slash" | "force-trailing-slash" | "drop-trailing-slash" | "none";
   not_found_handling?: "none" | "404-page" | "single-page-application";
   run_worker_first?: boolean | string[];
+  /** Public URL prefix assets are served under (default "/"); added 2026-10-28. */
+  base_path?: string;
   /** Contents of a `_headers` file (not the file path). */
   _headers?: string;
   /** Contents of a `_redirects` file (not the file path). */
@@ -195,6 +197,10 @@ export interface TelemetryQueryRequest {
   };
   view?: "events" | "calculations" | "invocations";
   limit?: number;
+  /** Events-view cursor: the `$metadata.id` of the last event of the previous page. */
+  offset?: string;
+  /** "next" pages toward older events (results are newest-first). */
+  offsetDirection?: "next" | "prev";
   /** Execute without persisting the query run (the pattern the official MCP server uses). */
   dry?: boolean;
 }

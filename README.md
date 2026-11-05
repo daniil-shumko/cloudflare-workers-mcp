@@ -35,8 +35,8 @@ so this server's headline feature is:
 ## Tools
 
 ### Static sites (the differentiator)
-- **deploy_static_site** - Deploy a local directory as a static site: manifest hashing, server-side dedupe (unchanged files never re-upload), `_headers`/`_redirects` support, SPA/404 handling, live workers.dev URL in the result
-- **redeploy_assets** - Redeploy reusing already-uploaded files (`keep_assets`) to change `html_handling`/`not_found_handling` without re-uploading
+- **deploy_static_site** - Deploy a local directory as a static site: manifest hashing, server-side dedupe (unchanged files never re-upload), `_headers`/`_redirects` support, SPA/404 handling, `base_path` URL prefix (where Cloudflare has enabled it for the account), live workers.dev URL in the result
+- **redeploy_assets** - Redeploy reusing already-uploaded files and asset config (`keep_assets`), e.g. to bump the compatibility date. To change `html_handling`/`not_found_handling`/`base_path`, re-run `deploy_static_site`: unchanged files dedupe, so nothing re-uploads
 
 ### Workers
 - **list_workers** - List all Worker scripts in your account
@@ -58,7 +58,7 @@ so this server's headline feature is:
 - **get_cron_triggers / set_cron_triggers** - Read or replace a Worker's cron trigger set
 
 ### Observability
-- **query_worker_logs** - Workers Logs with time window, error filter, and full-text search (requires observability enabled on the Worker)
+- **query_worker_logs** - Workers Logs with time window, error filter, full-text search, and cursor paging to older events (`next_cursor`). Requires observability enabled on the Worker
 - **health_check** - Verify API token and connection to Cloudflare
 
 ## Quick Start

@@ -74,6 +74,17 @@ test("formatError suggests a different name when the message includes 'already e
   assert.ok(result.suggestion?.includes("Choose a different name"));
 });
 
+test("formatError code 100343 explains that base_path is gated for the account", () => {
+  const result = formatError(
+    new CloudflareAPIError(
+      [{ code: 100343, message: "A non-root assets.base_path is not enabled for this account." }],
+      400
+    )
+  );
+  assert.equal(result.code, "CF_100343");
+  assert.ok(result.suggestion?.includes("base_path isn't enabled"));
+});
+
 test("formatError handles a plain Error", () => {
   const result = formatError(new Error("boom"));
   assert.equal(result.error, true);

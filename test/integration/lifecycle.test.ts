@@ -59,12 +59,27 @@ async function fetchUntilOk(url: string, deadlineMs: number): Promise<string> {
   throw new Error(`${url} did not serve within ${deadlineMs}ms (last status: ${lastStatus})`);
 }
 
+/** Poll a URL (any status) until its body matches, bounded by `deadlineMs`. */
+async function fetchUntilBody(url: string, pattern: RegExp, deadlineMs: number): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (pattern.test(await response.text())) return;
+    } catch {
+      // Transient — keep polling.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+  throw new Error(`${url} never matched ${pattern} within ${deadlineMs}ms`);
+}
+
 test(
   "live static-site lifecycle: deploy → serve → dedupe redeploy → delete",
   {
     skip: LIVE ? false : "set CF_LIVE_TEST=1 and CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID to run",
-    // Must exceed the sum of the two 180 s serve-polls plus deploy overhead.
-    timeout: 600000,
+    // Must exceed the sum of the three 180 s serve-polls plus deploy overhead.
+    timeout: 720000,
   },
   async () => {
     const scriptName = `cf-mcp-test-${Date.now().toString(36)}`;
@@ -148,6 +163,31 @@ test(
       );
       const versions = await call("list_versions", { script_name: scriptName });
       assert.ok((versions.payload.data?.versions?.length ?? 0) >= 2, "each deploy creates a version");
+
+      // Asset config is preserved by redeploy_assets (keep_assets). The
+      // dedupe redeploy above set no not_found_handling (default: plain 404),
+      // so re-apply 404-page through a zero-upload deploy_static_site, wait
+      // for the custom page, then check redeploy_assets keeps it.
+      const missingUrl = new URL("/does-not-exist", url).toString();
+      const reconfig = await call("deploy_static_site", {
+        script_name: scriptName,
+        directory: siteDir,
+        not_found_handling: "404-page",
+      });
+      assert.equal(reconfig.isError, false, `reconfig deploy failed: ${JSON.stringify(reconfig.payload)}`);
+      assert.equal(reconfig.payload.data?.files_uploaded, 0, "a config-only change uploads nothing");
+      await fetchUntilBody(missingUrl, /custom not found/, 180000);
+
+      const keep = await call("redeploy_assets", { script_name: scriptName });
+      assert.equal(keep.isError, false, `redeploy_assets failed: ${JSON.stringify(keep.payload)}`);
+      // Give the new version time to propagate, then the config must still hold.
+      await new Promise((resolve) => setTimeout(resolve, 20000));
+      assert.match(
+        await (await fetch(missingUrl)).text(),
+        /custom not found/,
+        "redeploy_assets must preserve the previous asset config"
+      );
+      assert.match(await fetchUntilOk(url, 60000), new RegExp(scriptName), "assets still served");
 
       // A module Worker via deploy_worker, served on workers.dev.
       const workerName = `${scriptName}-w`;

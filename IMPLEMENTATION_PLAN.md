@@ -3,7 +3,7 @@
 Sibling of [cloudflare-pages-mcp](https://github.com/daniil-shumko/cloudflare-pages-mcp)
 (local path: `~/workspace/personal/cloudflare-pages-mcp`), which is now in
 maintenance mode along with Cloudflare Pages itself. All API facts below were
-verified against live Cloudflare docs and repos on **2026-07-13**; sources at
+verified against live Cloudflare docs and repos on **2026-07-13** (re-checked **2026-11-05**); sources at
 the bottom. Re-verify anything marked *beta* before building on it.
 
 ## 1. Why this server exists
@@ -42,8 +42,13 @@ subdomain settings *are* covered, as a field on the beta Worker object).
 | Base | `/accounts/{account_id}/workers/scripts/{script_name}` | `/accounts/{account_id}/workers/workers/{worker_id}` |
 | Model | script name is the key | Worker (stable UUID) → Version (immutable) → Deployment |
 | Script upload | multipart form: `metadata` JSON part + one part per module | pure JSON; modules as `{name, content_type, content_base64}`; `?deploy=true` deploys in one call |
-| Status | fully supported, no sunset | **beta** since 2025-09-03 (TS SDK v5, Go SDK v6, Terraform ≥5.9); shapes may change |
-| Coverage | everything below | script/version/deployment + subdomain `{enabled, previews_enabled}` on the Worker object — no cron, no custom-domain attach |
+| Status | working; **tagged `deprecated` in the OpenAPI schema** (as of 2026-11-05, SDK group `workers.legacy.scripts`) for `GET /scripts`, `GET/PUT/DELETE /scripts/{name}`, `/settings`, `/subdomain`, `/versions` — no `deprecated: true` flag, no sunset date, no changelog post, not on the API deprecations page. `/deployments`, `/schedules`, `/secrets`, asset upload, `/domains`, account `/subdomain`, telemetry stay GA | **GA** (`x-fern-availability: generally-available`, seen 2026-11-05); beta since 2025-09-03 |
+| Coverage | everything below | script/version/deployment + subdomain `{enabled, previews_enabled}` on the Worker object + Worker Previews (beta) — no cron, no custom-domain attach |
+
+**Migration watch (2026-11-05):** nothing forces a move yet, but the
+deprecation tag signals a sunset is coming. Plan to move upload, settings,
+versions and subdomain onto `/workers/workers` (stable UUIDs, pure-JSON
+upload). Re-check the deprecations page before each release.
 
 ## 3. Endpoint reference (legacy API unless noted)
 
@@ -206,6 +211,25 @@ responses, `readOnlyHint`/`destructiveHint` annotations on every tool.
   verified in pages-mcp (6003/6111, 10000, 9109, 7000); add Workers-specific
   codes (e.g. 10007 script_not_found) as they are observed against the live
   API — don't guess them into the suggestion table untested.
+- **`keep_assets` ignores `assets.config` (verified live 2026-11-05)**: a
+  `keep_assets: true` upload keeps the previous version's assets *and* asset
+  config. Any `assets.config` sent alongside it is silently dropped, so
+  `html_handling`/`not_found_handling`/`base_path` changes need a fresh
+  upload-session JWT. `deploy_static_site` gets that cheaply, since unchanged
+  files dedupe to 0 uploads. That's why `redeploy_assets` has no config inputs
+  and a `.strict()` schema. (v1.0.0 advertised config inputs there that were
+  no-ops.)
+- **`assets.config.base_path` is gated per account**: added 2026-10-28, but a
+  non-root value returns `[100343] A non-root assets.base_path is not enabled
+  for this account.` on accounts without the rollout. The kustos test account
+  is one of these, so the live test can't cover it yet.
+- **Telemetry pagination**: `events.count` is the *page* size, not a total.
+  Events come newest-first. Pass the last event's `$metadata.id` as `offset`
+  with `offsetDirection: "next"` to get the next older page with no overlap
+  (verified live 2026-11-05). `query_worker_logs` exposes this as
+  `cursor`/`next_cursor`.
+- **Compatibility dates**: `nodejs_compat` (+ `_v2`) is on by default for
+  `compatibility_date >= 2026-08-04`, so the today-default needs no flag.
 - **Deliberate non-goals for v1**: routes on zones (`/zones/{id}/workers/routes`
   — zone-scoped tokens complicate the permission story), Workers-for-Platforms
   dispatch namespaces, Durable Object migrations beyond pass-through, tail
@@ -257,3 +281,9 @@ advertised tool set), `test/integration` (guarded live e2e). See `test/README.md
 - Official MCP servers are read-only for Workers: github.com/cloudflare/mcp-server-cloudflare (apps/workers-bindings; issues #63, #213, #246)
 - Observability telemetry query API: developers.cloudflare.com/workers/observability/ (+ packages/mcp-common/src/api/workers-observability.api.ts in the repo above)
 - File limits (100k paid since 2025-09-02): developers.cloudflare.com/changelog/post/2025-09-02-increased-static-asset-limits/
+
+Added 2026-11-05:
+- OpenAPI schema (legacy-Scripts `deprecated` tags, Workers API GA, telemetry `offset`/`offsetDirection`): raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json
+- `assets.base_path` (2026-10-28): developers.cloudflare.com/changelog/post/2026-10-28-static-assets-base-path/ and developers.cloudflare.com/workers/static-assets/routing/advanced/serving-a-subdirectory/
+- `nodejs_compat` default for compat dates ≥ 2026-08-04: developers.cloudflare.com/changelog/post/2026-08-04-nodejs-compat-default/
+- API deprecations page (lists only KV legacy routes as of 2026-11-05): developers.cloudflare.com/fundamentals/api/reference/deprecations/

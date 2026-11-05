@@ -15,7 +15,8 @@ script lifecycle, versions/deployments/rollback, domains/subdomain/cron, and
 log queries. **Read `IMPLEMENTATION_PLAN.md` before changing API-facing
 code** — it carries verified API endpoint documentation (including the
 static-asset direct-upload protocol) and the design gotchas; all endpoint
-facts were re-verified against live Cloudflare docs on 2026-07-13.
+facts were re-verified against live Cloudflare docs on 2026-07-13 and re-checked
+(OpenAPI schema + changelog + live probes) on 2026-11-05.
 
 This repo is the successor to
 [cloudflare-pages-mcp](https://github.com/daniil-shumko/cloudflare-pages-mcp)

@@ -89,6 +89,14 @@ const NotFoundHandlingSchema = z
     "Response when no asset matches: 'single-page-application' serves /index.html (SPA mode), '404-page' serves /404.html (default: none)"
   );
 
+const BasePathSchema = z
+  .string()
+  .regex(/^\//, "base_path must start with '/'")
+  .optional()
+  .describe(
+    "Serve the assets under this URL prefix, e.g. '/blog' (default '/'). Paths in _headers and _redirects must include the prefix; requests outside it don't resolve assets. Cloudflare is rolling this out per account — a non-root value may fail with error 100343 until enabled."
+  );
+
 const DeployStaticSiteSchema = z.object({
   script_name: z
     .string()
@@ -98,6 +106,7 @@ const DeployStaticSiteSchema = z.object({
     .describe("Path to the built site directory to upload (absolute path recommended)"),
   html_handling: HtmlHandlingSchema,
   not_found_handling: NotFoundHandlingSchema,
+  base_path: BasePathSchema,
   compatibility_date: z
     .string()
     .optional()
@@ -110,15 +119,20 @@ const DeployStaticSiteSchema = z.object({
     ),
 });
 
-const RedeployAssetsSchema = z.object({
-  script_name: z.string().describe("The name of the Worker script"),
-  html_handling: HtmlHandlingSchema,
-  not_found_handling: NotFoundHandlingSchema,
-  compatibility_date: z
-    .string()
-    .optional()
-    .describe("Worker compatibility date (YYYY-MM-DD); defaults to today"),
-});
+// No asset-config inputs: with keep_assets the API silently ignores
+// assets.config (verified live 2026-11-05) and keeps the previous version's
+// config. Config changes go through deploy_static_site, which dedupes and
+// uploads nothing when files are unchanged. .strict() makes stale callers that
+// still pass html_handling/not_found_handling fail loudly instead of no-op.
+const RedeployAssetsSchema = z
+  .object({
+    script_name: z.string().describe("The name of the Worker script"),
+    compatibility_date: z
+      .string()
+      .optional()
+      .describe("Worker compatibility date (YYYY-MM-DD); defaults to the Worker's current date"),
+  })
+  .strict();
 
 // The v1 binding subset (IMPLEMENTATION_PLAN.md M3). Values pass through to
 // metadata.bindings verbatim; the discriminated union keeps each type's
@@ -175,7 +189,12 @@ const DeployWorkerSchema = z.object({
     .string()
     .optional()
     .describe("YYYY-MM-DD; defaults to today (if omitted at the API level it would fall back to 2021-11-02)"),
-  compatibility_flags: z.array(z.string()).optional(),
+  compatibility_flags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Runtime compatibility flags. nodejs_compat is on by default for compatibility_date >= 2026-08-04, so it is not needed with the default (today) date"
+    ),
   keep_assets: z
     .boolean()
     .optional()
@@ -201,7 +220,12 @@ const CreateVersionSchema = z.object({
   main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
   bindings: z.array(BindingSchema).optional().describe("Resource bindings for this version"),
   compatibility_date: z.string().optional().describe("YYYY-MM-DD; defaults to today"),
-  compatibility_flags: z.array(z.string()).optional(),
+  compatibility_flags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Runtime compatibility flags. nodejs_compat is on by default for compatibility_date >= 2026-08-04, so it is not needed with the default (today) date"
+    ),
   keep_assets: z
     .boolean()
     .optional()
@@ -261,7 +285,12 @@ const UpdateWorkerSettingsSchema = z.object({
     .optional()
     .describe("Resource bindings — REPLACES the Worker's full binding set"),
   compatibility_date: z.string().optional().describe("YYYY-MM-DD"),
-  compatibility_flags: z.array(z.string()).optional(),
+  compatibility_flags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Runtime compatibility flags. nodejs_compat is on by default for compatibility_date >= 2026-08-04, so it is not needed with the default (today) date"
+    ),
   logpush: z.boolean().optional(),
   observability: z
     .object({
@@ -322,6 +351,12 @@ const QueryWorkerLogsSchema = z.object({
     .describe("Maximum events to return (default 20)"),
   errors_only: z.boolean().optional().describe("Only return events that carry an error"),
   search: z.string().optional().describe("Full-text needle matched across all log fields"),
+  cursor: z
+    .string()
+    .optional()
+    .describe(
+      "Pagination cursor: pass the next_cursor from a previous call (with the same filters) to fetch the next page of older events"
+    ),
 });
 
 /** Today as YYYY-MM-DD — the compatibility_date fallback for brand-new Workers. */
@@ -638,7 +673,7 @@ async function main() {
     {
       title: "Deploy Static Site",
       description:
-        "Deploy a local directory as a static site on Workers (assets-only Worker): builds the file manifest, uploads only files Cloudflare doesn't already have, and deploys. Newly created sites are served on workers.dev. Set not_found_handling to 'single-page-application' for SPAs. _headers/_redirects at the directory root are applied as configuration (not uploaded), and .assetsignore rules (gitignore-style) exclude files from the deploy.",
+        "Deploy a local directory as a static site on Workers (assets-only Worker): builds the file manifest, uploads only files Cloudflare doesn't already have, and deploys. Newly created sites are served on workers.dev. Set not_found_handling to 'single-page-application' for SPAs, and base_path to serve the site under a URL prefix (e.g. '/docs'). _headers/_redirects at the directory root are applied as configuration (not uploaded), and .assetsignore rules (gitignore-style) exclude files from the deploy.",
       inputSchema: DeployStaticSiteSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
@@ -650,6 +685,7 @@ async function main() {
       const config: AssetsConfig = {
         ...(input.html_handling && { html_handling: input.html_handling }),
         ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
+        ...(input.base_path && { base_path: input.base_path }),
         ...(collected.headers !== undefined && { _headers: collected.headers }),
         ...(collected.redirects !== undefined && { _redirects: collected.redirects }),
       };
@@ -695,19 +731,14 @@ async function main() {
     {
       title: "Redeploy Assets",
       description:
-        "Create a new deployment of an assets-only Worker that reuses its previously uploaded files (keep_assets) — useful to change html_handling or not_found_handling without re-uploading the site.",
+        "Create a new deployment of an assets-only Worker that reuses its previously uploaded files and asset config (keep_assets) — e.g. to bump compatibility_date. It cannot change html_handling/not_found_handling/base_path: Cloudflare ignores asset config without a fresh upload, so use deploy_static_site for that (unchanged files dedupe, so nothing is re-uploaded).",
       inputSchema: RedeployAssetsSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
       const existing = await getExistingSettings(input.script_name);
-      const config: AssetsConfig = {
-        ...(input.html_handling && { html_handling: input.html_handling }),
-        ...(input.not_found_handling && { not_found_handling: input.not_found_handling }),
-      };
       const metadata: ScriptUploadMetadata = {
         keep_assets: true,
-        ...(Object.keys(config).length > 0 && { assets: { config } }),
         compatibility_date:
           input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
       };
@@ -718,9 +749,9 @@ async function main() {
         {
           script_name: input.script_name,
           assets_reused: true,
-          config_applied: Object.keys(config).length > 0 ? config : undefined,
+          compatibility_date: metadata.compatibility_date,
         },
-        `Redeployed ${input.script_name} reusing existing assets`
+        `Redeployed ${input.script_name} reusing existing assets and asset config`
       );
     }
   );
@@ -1181,20 +1212,27 @@ async function main() {
         },
         view: "events",
         limit: input.limit,
+        ...(input.cursor && { offset: input.cursor, offsetDirection: "next" as const }),
         dry: true,
       });
 
+      // events.count is the size of this page, not a total, so "more" is
+      // inferred from a full page. Events are newest-first; the last event's
+      // id is the cursor for the next (older) page.
       const events = response.result?.events?.events ?? [];
-      const total = response.result?.events?.count ?? events.length;
+      const lastId = events[events.length - 1]?.$metadata?.id;
+      const nextCursor = events.length >= input.limit ? lastId : undefined;
       return ok(
         {
           script_name: input.script_name,
           timeframe: { from: new Date(from).toISOString(), to: new Date(to).toISOString() },
-          total_matching: total,
           showing: events.length,
+          has_more: nextCursor !== undefined,
+          next_cursor: nextCursor,
           events: events.map(summarizeLogEvent),
         },
-        `Retrieved ${events.length} of ${total} matching log event(s)` +
+        `Retrieved ${events.length} log event(s)` +
+          (nextCursor ? " — more may exist; pass next_cursor as cursor to page further back" : "") +
           (events.length === 0
             ? " — if you expected logs, check that the Worker has observability enabled and has received traffic in the window"
             : "")

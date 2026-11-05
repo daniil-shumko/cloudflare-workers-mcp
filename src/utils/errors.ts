@@ -82,6 +82,11 @@ function getSuggestionForError(error: CloudflareAPIError): string | undefined {
     return "Your API token cannot access this resource. Ensure it has the 'Workers Scripts: Edit' permission and includes the correct account (CLOUDFLARE_ACCOUNT_ID).";
   }
 
+  // 100343: assets.base_path is still gated per account (observed 2026-11-05).
+  if (errorCode === 100343 || errorMessage.includes("base_path is not enabled")) {
+    return "A non-root base_path isn't enabled for this Cloudflare account yet. Deploy without base_path (serves at '/'), or route a path prefix to a Worker instead.";
+  }
+
   // Not found errors
   if (errorCode === 7000 || errorMessage.includes("not found")) {
     return "The requested resource was not found. Use list_workers to find valid Worker names.";
