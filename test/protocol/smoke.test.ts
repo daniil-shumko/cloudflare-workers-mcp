@@ -26,6 +26,13 @@ const EXPECTED_TOOLS = [
   "delete_worker_domain",
   "set_workers_dev",
   "query_worker_logs",
+  "tail_worker",
+  "list_secrets",
+  "set_secrets",
+  "delete_secret",
+  "deploy_preview",
+  "list_previews",
+  "delete_preview",
   "health_check",
 ].sort();
 
@@ -125,6 +132,30 @@ for (const { era, options } of ERAS) {
       })) as ToolCallResult;
       assert.equal(staleRedeploy.isError, true, "redeploy_assets should reject asset-config inputs");
       assert.match(textOf(staleRedeploy), VALIDATION_ERROR, "unknown keys should fail input validation");
+
+      // ---- new-tool schemas reject bad input before any API call ----
+      const rejects = async (name: string, args: Record<string, unknown>, why: string) => {
+        const result = (await client.callTool({ name, arguments: args })) as ToolCallResult;
+        assert.equal(result.isError, true, why);
+        assert.match(textOf(result), VALIDATION_ERROR, why);
+      };
+      await rejects("set_secrets", { script_name: "x", secrets: {} }, "set_secrets needs at least one secret");
+      await rejects(
+        "tail_worker",
+        { script_name: "x", trigger_url: "http://insecure.example" },
+        "tail_worker trigger_url must be https"
+      );
+      await rejects("tail_worker", { script_name: "x", duration_seconds: 120 }, "tail window is capped");
+      await rejects(
+        "deploy_preview",
+        { script_name: "x", preview_name: "p" },
+        "deploy_preview needs a directory or modules"
+      );
+      await rejects(
+        "deploy_preview",
+        { script_name: "x", preview_name: "p", directory: ".", modules: [{ name: "a.js", content: "" }] },
+        "deploy_preview rejects both directory and modules"
+      );
 
       // ---- newer optional inputs are advertised ----
       const propsOf = (name: string) =>

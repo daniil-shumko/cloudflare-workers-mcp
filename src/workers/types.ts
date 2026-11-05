@@ -266,3 +266,69 @@ export interface ScriptUploadMetadata {
   observability?: { enabled: boolean; head_sampling_rate?: number };
   annotations?: { "workers/message"?: string; "workers/tag"?: string };
 }
+
+/** A secret binding as returned by the secrets endpoints (never includes the value). */
+export interface WorkerSecret {
+  name: string;
+  type: "secret_text" | "secret_key" | string;
+}
+
+/** Result of POST .../scripts/{name}/tails. */
+export interface WorkerTail {
+  id: string;
+  /** WebSocket URL; connect with the "trace-v1" subprotocol. */
+  url: string;
+  expires_at: string;
+}
+
+/** One trace-v1 tail event (loosely typed; shape varies by event kind). */
+export interface TailEvent {
+  outcome?: string;
+  scriptName?: string;
+  eventTimestamp?: number;
+  cpuTime?: number;
+  wallTime?: number;
+  truncated?: boolean;
+  scriptVersion?: { id?: string; tag?: string; message?: string };
+  logs?: Array<{ message?: unknown[]; level?: string; timestamp?: number }>;
+  exceptions?: Array<{ name?: string; message?: string; stack?: string; timestamp?: number }>;
+  event?: {
+    request?: { url?: string; method?: string; headers?: Record<string, string>; cf?: unknown };
+    response?: { status?: number };
+    cron?: string;
+    scheduledTime?: number;
+    [key: string]: unknown;
+  } | null;
+  [key: string]: unknown;
+}
+
+/** A Worker Preview (beta, new Workers API). */
+export interface WorkerPreview {
+  id: string;
+  name: string;
+  slug: string;
+  /** Stable alias URL(s); empty until the Worker's subdomain has previews_enabled. */
+  urls?: string[];
+  created_on?: string;
+  updated_on?: string;
+  deployed_on?: string | null;
+}
+
+/** One deployment of a Preview. */
+export interface PreviewDeployment {
+  id: string;
+  number?: number;
+  /** Per-deployment URL(s), e.g. https://<id8>-<worker>.<account>.workers.dev */
+  urls?: string[];
+  created_on?: string;
+}
+
+/** Request body for POST .../previews/{id}/deployments (JSON, base64 modules). */
+export interface PreviewDeploymentBody {
+  main_module?: string;
+  modules?: Array<{ name: string; content_type: string; content_base64: string }>;
+  bindings?: Array<Record<string, unknown>>;
+  compatibility_date?: string;
+  compatibility_flags?: string[];
+  assets?: { jwt: string; config?: AssetsConfig };
+}

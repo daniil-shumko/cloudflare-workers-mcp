@@ -10,9 +10,10 @@ custom domains, and cron triggers. It connects via stdio transport for use with
 Claude Desktop and Claude Code.
 
 **Project status: feature-complete v1.** All six milestones (M1–M6) are
-implemented — 22 tools covering static-site deploys (the headline feature),
-script lifecycle, versions/deployments/rollback, domains/subdomain/cron, and
-log queries. **Read `IMPLEMENTATION_PLAN.md` before changing API-facing
+implemented — 29 tools covering static-site deploys (the headline feature),
+script lifecycle, versions/deployments/rollback, domains/subdomain/cron, log
+queries and live tail, secrets, and Worker Previews (beta, on the new Workers
+API). **Read `IMPLEMENTATION_PLAN.md` before changing API-facing
 code** — it carries verified API endpoint documentation (including the
 static-asset direct-upload protocol) and the design gotchas; all endpoint
 facts were re-verified against live Cloudflare docs on 2026-07-13 and re-checked
@@ -67,6 +68,7 @@ src/
 ├── workers/
 │   ├── client.ts      # Cloudflare Workers API HTTP client (WorkersClient)
 │   ├── assets.ts      # Manifest hashing + asset upload-session/bucket flow
+│   ├── tail.ts        # Bounded live-tail collector (trace-v1 WebSocket)
 │   ├── summarize.ts   # Pure response summarizers
 │   └── types.ts       # TypeScript types for API requests/responses
 └── utils/
@@ -114,9 +116,13 @@ renames a tool.
 
 Base URL: `https://api.cloudflare.com/client/v4/accounts/{account_id}/workers`
 
-This server uses the **legacy Scripts API** (stable, full coverage), not the
-beta Workers API — the rationale, all endpoint documentation, the asset-upload
-protocol, and the milestone plan live in `IMPLEMENTATION_PLAN.md`.
+This server uses the **legacy Scripts API** for script lifecycle. It is now
+tagged deprecated in Cloudflare's OpenAPI schema but has no sunset date. The
+exceptions are the Worker Previews tools, which use the GA **Workers API**
+(`/workers/workers/{name}`; names work as ids). Secrets, tail, deployments,
+cron, domains, asset upload and telemetry are on GA scripts-path endpoints.
+The rationale, endpoint docs, asset-upload protocol, and the staged migration
+plan off the deprecated endpoints (§10) live in `IMPLEMENTATION_PLAN.md`.
 
 ## Toolchain constraints (do not "fix" these)
 
