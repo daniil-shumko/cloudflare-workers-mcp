@@ -1,9 +1,22 @@
 name: Release
 
+# Publishes to npm via Trusted Publishing (OIDC): no NPM_TOKEN secret. The
+# trusted publisher configured on npmjs.com must name this exact workflow
+# filename (release.yml), since npm validates the calling workflow.
 on:
   push:
     tags:
       - 'v*'
+  # Manual (re)publish of an existing tag, e.g. one whose npm publish failed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. v1.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -11,6 +24,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -36,16 +51,28 @@ jobs:
   publish-npm:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm Trusted Publishing (+ automatic provenance)
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 22
-          cache: 'npm'
+          # Node 24 bundles npm 11; Trusted Publishing needs npm >= 11.5.1.
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false # no dependency cache in release builds
+
+      - name: Check npm supports Trusted Publishing
+        run: |
+          npm --version
+          node -e "const [a,b,c]=process.argv[1].split('.').map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)" "$(npm --version)" \
+            || { echo "npm >= 11.5.1 is required for Trusted Publishing"; exit 1; }
 
       - name: Install dependencies
         run: npm ci
@@ -55,18 +82,15 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     needs: test
+    # The release for a manually republished tag already exists.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
