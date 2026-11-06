@@ -46,7 +46,7 @@ so this server's headline feature is:
 - **list_workers** - List all Workers in your account with created/modified/last-deployed times and workers.dev/observability status
 - **get_worker** - Settings (bindings, compat date/flags, placement, observability) plus cron triggers and workers.dev status
 - **get_worker_code** - Download a Worker's deployed source (all modules)
-- **deploy_worker** - Upload and deploy ES-module Workers with bindings (`plain_text`, `secret_text`, `kv_namespace`, `r2_bucket`, `d1`, `assets`). Existing secrets are kept across redeploys
+- **deploy_worker** - Upload and deploy ES-module Workers with bindings (`plain_text`, `secret_text`, `kv_namespace`, `r2_bucket`, `d1`, `assets`). Each module is inline `content` or a local file `path` (bundled `.js`, `.wasm`, text/data), so large sources never pass through the conversation. Existing secrets are kept across redeploys
 - **update_worker_settings** - Change bindings/compat/logpush/observability without re-uploading code (existing secrets are kept unless listed)
 - **delete_worker** - Permanently delete a Worker (optional `force`)
 

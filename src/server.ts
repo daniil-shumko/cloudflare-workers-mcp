@@ -19,6 +19,7 @@ import { z } from "zod";
 import { CloudflareAPIError, WorkersClient } from "./workers/client.js";
 import { collectAssets, uploadAssets } from "./workers/assets.js";
 import { collectTail } from "./workers/tail.js";
+import { loadModules } from "./workers/modules.js";
 import {
   summarizeDeployment,
   summarizeDomain,
@@ -177,20 +178,40 @@ const BindingSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
-const ModuleSchema = z.object({
-  name: z.string().describe("Module filename, e.g. index.js"),
-  content: z.string().describe("Module source code"),
-  content_type: z
-    .string()
-    .optional()
-    .describe("Part content type (default application/javascript+module)"),
-});
+// Strict: an unknown key (e.g. "file") must fail validation rather than be
+// silently stripped and deploy an empty module (issue #1).
+const ModuleSchema = z
+  .strictObject({
+    name: z
+      .string()
+      .optional()
+      .describe("Module filename, e.g. index.js. Required with content; defaults to the file's basename with path"),
+    content: z.string().optional().describe("Inline module source code. Use path instead for large or bundled sources"),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        "Local file to upload as this module (absolute path recommended), e.g. a bundled dist/index.js or a .wasm file. The server reads it, so the source never passes through the conversation"
+      ),
+    content_type: z
+      .string()
+      .optional()
+      .describe(
+        "Module content type. Default: inferred from the path's extension (.js/.mjs ES module, .cjs, .py, .wasm, .txt/.html/.sql text, .bin data), else application/javascript+module"
+      ),
+  })
+  .refine((m) => (m.content === undefined) !== (m.path === undefined), {
+    message: "Provide exactly one of content (inline source) or path (local file)",
+  })
+  .refine((m) => m.path !== undefined || m.name !== undefined, {
+    message: "name is required when the module uses inline content",
+  });
 
 const DeployWorkerSchema = z.object({
   script_name: z
     .string()
     .describe("Worker name (lowercase, alphanumeric and hyphens)"),
-  modules: z.array(ModuleSchema).min(1).describe("ES modules; the first is the entry point unless main_module says otherwise"),
+  modules: z.array(ModuleSchema).min(1).describe("Modules, each with inline content or a local file path; the first is the entry point unless main_module says otherwise"),
   main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
   bindings: z.array(BindingSchema).optional().describe("Resource bindings (replaces the full set)"),
   compatibility_date: z
@@ -224,7 +245,7 @@ const CreateVersionSchema = z.object({
   modules: z
     .array(ModuleSchema)
     .min(1)
-    .describe("ES modules; the first is the entry point unless main_module says otherwise"),
+    .describe("Modules, each with inline content or a local file path; the first is the entry point unless main_module says otherwise"),
   main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
   bindings: z.array(BindingSchema).optional().describe("Resource bindings for this version"),
   compatibility_date: z.string().optional().describe("YYYY-MM-DD; defaults to today"),
@@ -358,7 +379,7 @@ const DeployPreviewSchema = z
       .array(ModuleSchema)
       .min(1)
       .optional()
-      .describe("Worker code: ES modules; the first is the entry point unless main_module says otherwise"),
+      .describe("Worker code: modules, each with inline content or a local file path; the first is the entry point unless main_module says otherwise"),
     main_module: z.string().optional().describe("Entry-point module name (default: first module)"),
     bindings: z.array(BindingSchema).optional().describe("Bindings for the preview (modules mode)"),
     compatibility_date: z
@@ -794,16 +815,6 @@ export function buildServer(workers: WorkersClient): McpServer {
     };
   }
 
-  function toVersionModules(
-    modules: Array<{ name: string; content: string; content_type?: string }>
-  ): VersionModule[] {
-    return modules.map((mod) => ({
-      name: mod.name,
-      content_type: mod.content_type ?? "application/javascript+module",
-      content_base64: Buffer.from(mod.content, "utf8").toString("base64"),
-    }));
-  }
-
   /**
    * Annotations for versions created by merge-patching `latest`: set an
    * explicit message and clear any inherited tag, so the new version doesn't
@@ -1022,17 +1033,13 @@ export function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Deploy Worker",
       description:
-        "Upload and deploy a Worker script (ES modules) with optional bindings (plain_text, secret_text, kv_namespace, r2_bucket, d1, assets). Replaces the Worker's code and binding set if it already exists; existing secrets are kept unless you pass a binding with the same name. Set keep_assets to retain a site's static assets while updating code. By default a new Worker is served on workers.dev.",
+        "Upload and deploy a Worker script (ES modules) with optional bindings (plain_text, secret_text, kv_namespace, r2_bucket, d1, assets). Replaces the Worker's code and binding set if it already exists; existing secrets are kept unless you pass a binding with the same name. Each module is either inline content or a local file path; prefer path for bundled or large code (the server reads the file, so the source stays out of the conversation, and binary .wasm modules work). Set keep_assets to retain a site's static assets while updating code. By default a new Worker is served on workers.dev.",
       inputSchema: DeployWorkerSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      const mainModule = input.main_module ?? input.modules[0].name;
-      if (!input.modules.some((m) => m.name === mainModule)) {
-        throw new Error(
-          `main_module "${mainModule}" does not match any provided module name (${input.modules.map((m) => m.name).join(", ")}).`
-        );
-      }
+      // Read and validate every module before anything is created remotely.
+      const loaded = await loadModules(input.modules, input.main_module);
 
       const existing = await getExisting(input.script_name);
       if (input.keep_assets && !existing) {
@@ -1040,8 +1047,8 @@ export function buildServer(workers: WorkersClient): McpServer {
       }
       const { bindings, inherited } = withInheritedSecrets(input.bindings ?? [], existing);
       const code: VersionBody = {
-        main_module: mainModule,
-        modules: toVersionModules(input.modules),
+        main_module: loaded.mainModule,
+        modules: loaded.modules,
         bindings,
         compatibility_date:
           input.compatibility_date ?? existing?.liveVersion?.compatibility_date ?? todayISO(),
@@ -1085,8 +1092,8 @@ export function buildServer(workers: WorkersClient): McpServer {
         {
           script_name: input.script_name,
           version_id: version?.id,
-          main_module: mainModule,
-          modules: input.modules.map((m) => m.name),
+          main_module: loaded.mainModule,
+          modules: loaded.names,
           bindings: (input.bindings ?? []).map((b) => ({ type: b.type, name: b.name })),
           ...(inherited.length > 0 && { secrets_kept: inherited }),
           compatibility_date: code.compatibility_date,
@@ -1278,12 +1285,8 @@ export function buildServer(workers: WorkersClient): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      const mainModule = input.main_module ?? input.modules[0].name;
-      if (!input.modules.some((m) => m.name === mainModule)) {
-        throw new Error(
-          `main_module "${mainModule}" does not match any provided module name (${input.modules.map((m) => m.name).join(", ")}).`
-        );
-      }
+      // Read and validate every module before anything is created remotely.
+      const loaded = await loadModules(input.modules, input.main_module);
 
       const existing = await getExisting(input.script_name);
       if (!existing) {
@@ -1293,8 +1296,8 @@ export function buildServer(workers: WorkersClient): McpServer {
       }
       const { bindings } = withInheritedSecrets(input.bindings ?? [], existing);
       const code: VersionBody = {
-        main_module: mainModule,
-        modules: toVersionModules(input.modules),
+        main_module: loaded.mainModule,
+        modules: loaded.modules,
         bindings,
         compatibility_date:
           input.compatibility_date ?? existing.liveVersion?.compatibility_date ?? todayISO(),
@@ -1656,9 +1659,9 @@ export function buildServer(workers: WorkersClient): McpServer {
           files_reused: upload.skipped,
         };
       } else {
-        const modules = input.modules!;
-        body.main_module = input.main_module ?? modules[0].name;
-        body.modules = toVersionModules(modules);
+        const loaded = await loadModules(input.modules!, input.main_module);
+        body.main_module = loaded.mainModule;
+        body.modules = loaded.modules;
         if (input.bindings) body.bindings = input.bindings;
       }
 

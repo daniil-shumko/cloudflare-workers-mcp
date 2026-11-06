@@ -91,6 +91,26 @@ test(
     await writeFile(join(siteDir, "css", "style.css"), "body{color:rebeccapurple}");
     await writeFile(join(siteDir, "_headers"), "/*\n  X-Cf-Mcp-Test: 1");
 
+    // Worker modules on disk (issue #1): an entry that imports a binary .wasm,
+    // which inline string content can't carry.
+    const modDir = await mkdtemp(join(tmpdir(), "cf-mcp-live-mod-"));
+    await writeFile(
+      join(modDir, "worker.js"),
+      [
+        'import addWasm from "./add.wasm";',
+        "const { exports } = await WebAssembly.instantiate(addWasm);",
+        "export default { fetch() { return new Response('cf-mcp-test from disk 2+3=' + exports.add(2, 3)); } };",
+      ].join("\n")
+    );
+    // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+    await writeFile(
+      join(modDir, "add.wasm"),
+      Buffer.from(
+        "0061736d0100000001070160027f7f017f030201000707010361646400000a09010700200020016a0b",
+        "hex"
+      )
+    );
+
     const transport = new StdioClientTransport({
       command: "node",
       args: ["--import", "tsx", "src/index.ts"],
@@ -463,8 +483,20 @@ test(
         /cf-mcp-test sw/
       );
 
+      // ---- deploy_worker from local files (issue #1), including a binary .wasm module ----
+      const fileName = `${scriptName}-f`;
+      needsCleanup.add(fileName);
+      const fromDisk = await call("deploy_worker", {
+        script_name: fileName,
+        modules: [{ path: join(modDir, "worker.js") }, { path: join(modDir, "add.wasm") }],
+      });
+      assert.equal(fromDisk.isError, false, `deploy_worker from paths failed: ${JSON.stringify(fromDisk.payload)}`);
+      assert.equal(fromDisk.payload.data?.main_module, "worker.js");
+      assert.deepEqual(fromDisk.payload.data?.modules, ["worker.js", "add.wasm"]);
+      assert.match(await fetchUntilOk(String(fromDisk.payload.data?.url), 180000), /cf-mcp-test from disk 2\+3=5/);
+
       // Delete everything through the tool and unmark cleanup.
-      for (const name of [workerName, scriptName, swName]) {
+      for (const name of [workerName, scriptName, swName, fileName]) {
         const del = await call("delete_worker", { script_name: name, force: true });
         assert.equal(del.isError, false, `delete_worker failed: ${JSON.stringify(del.payload)}`);
         needsCleanup.delete(name);
@@ -479,6 +511,7 @@ test(
       }
       await client.close();
       await rm(siteDir, { recursive: true, force: true });
+      await rm(modDir, { recursive: true, force: true });
     }
   }
 );

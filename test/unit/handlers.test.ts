@@ -188,6 +188,47 @@ test("deploy_worker keeps the live version's secrets via pinned inherit bindings
   }
 });
 
+test("deploy_worker uploads a module from a local file path (issue #1)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cf-mcp-unit-mod-"));
+  const src = "export default { fetch() { return new Response('from disk') } }";
+  await writeFile(join(dir, "worker.js"), src);
+  const cf = fakeCloudflare({
+    ...existingRoutes([]),
+    [`POST /workers/${NAME}/versions?deploy=true`]: { result: { id: "v-2", number: 2 } },
+  });
+  const mcp = await connect();
+  try {
+    const res = await mcp.call("deploy_worker", { script_name: NAME, modules: [{ path: join(dir, "worker.js") }] });
+    assert.equal(res.isError, false, JSON.stringify(res.payload));
+    assert.equal(res.payload.data.main_module, "worker.js");
+    assert.deepEqual(res.payload.data.modules, ["worker.js"]);
+    const body = cf.calls.find((c) => c.method === "POST")?.body as {
+      main_module: string;
+      modules: Array<{ name: string; content_base64: string }>;
+    };
+    assert.equal(body.main_module, "worker.js");
+    assert.equal(Buffer.from(body.modules[0].content_base64, "base64").toString("utf8"), src);
+  } finally {
+    await mcp.close();
+    cf.restore();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("deploy_worker with a missing module file fails before creating anything", async () => {
+  const cf = fakeCloudflare({});
+  const mcp = await connect();
+  try {
+    const res = await mcp.call("deploy_worker", { script_name: NAME, modules: [{ path: "/nonexistent/cf-mcp/worker.js" }] });
+    assert.equal(res.isError, true);
+    assert.match(res.payload.message, /Module file not found/);
+    assert.equal(cf.calls.length, 0, "no Cloudflare call made");
+  } finally {
+    await mcp.close();
+    cf.restore();
+  }
+});
+
 test("deploy_worker deletes the Worker it just created when the version upload fails", async () => {
   const cf = fakeCloudflare({
     [`GET /workers/${NAME}`]: notFound,

@@ -69,6 +69,7 @@ src/
 ├── workers/
 │   ├── client.ts      # Cloudflare Workers API HTTP client (WorkersClient)
 │   ├── assets.ts      # Manifest hashing + asset upload-session/bucket flow
+│   ├── modules.ts     # Worker module sources: inline content or local file path
 │   ├── tail.ts        # Bounded live-tail collector (trace-v1 WebSocket)
 │   ├── summarize.ts   # Pure response summarizers
 │   └── types.ts       # TypeScript types for API requests/responses
