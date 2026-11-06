@@ -407,6 +407,28 @@ test(
       await new Promise((resolve) => setTimeout(resolve, 15000));
       assert.match(await fetchUntilOk(url, 60000), new RegExp(scriptName), "assets still served after adding code");
 
+      // ---- deploy_static_site over code: an assets-only version can't hold
+      // bindings, so Cloudflare drops the secrets. The tool must say so. ----
+      const siteSecret = await call("set_secrets", {
+        script_name: scriptName,
+        secrets: { SITE_SECRET: "cf-mcp-test-site" },
+      });
+      assert.equal(siteSecret.isError, false, `set_secrets on site failed: ${JSON.stringify(siteSecret.payload)}`);
+      const backToSite = await call("deploy_static_site", {
+        script_name: scriptName,
+        directory: siteDir,
+        not_found_handling: "404-page",
+      });
+      assert.equal(backToSite.isError, false, `deploy_static_site over code failed: ${JSON.stringify(backToSite.payload)}`);
+      assert.deepEqual(backToSite.payload.data?.secrets_dropped, ["SITE_SECRET"]);
+      assert.match(String(backToSite.payload.data?.warning), /set_secrets/);
+      const siteSecrets = await call("list_secrets", { script_name: scriptName });
+      assert.deepEqual(
+        siteSecrets.payload.data?.secrets,
+        [],
+        `the warning matches reality: ${JSON.stringify(siteSecrets.payload)}`
+      );
+
       // ---- set_workers_dev toggles serving and reports the URL ----
       const off = await call("set_workers_dev", { script_name: workerName, enabled: false });
       assert.equal(off.isError, false, `set_workers_dev off failed: ${JSON.stringify(off.payload)}`);
