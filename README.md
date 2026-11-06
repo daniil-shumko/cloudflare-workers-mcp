@@ -12,7 +12,10 @@
 > build from source rather than trusting the npm artifact (or at least pin an
 > exact version); (3) give the API token the minimum permission
 > (**Workers Scripts: Edit**) and nothing else; (4) prefer a test account for
-> the first runs.
+> the first runs; (5) tools that take a local path (`directory`,
+> `modules[].path`) upload whatever they point at to your Cloudflare account,
+> where it can become publicly reachable, so keep your MCP client's approval
+> prompts on for the deploy tools and check those paths before approving.
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for
 managing Cloudflare Workers from Claude Desktop or Claude Code — the successor
