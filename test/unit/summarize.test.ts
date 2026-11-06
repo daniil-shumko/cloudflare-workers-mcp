@@ -12,60 +12,55 @@ import type {
   TelemetryEvent,
   WorkerDeployment,
   WorkerDomain,
-  WorkerScript,
+  WorkerInfo,
   WorkerVersion,
 } from "../../src/workers/types.js";
 
-test("summarizeWorker maps id to name and keeps the agent-relevant fields", () => {
-  const script: WorkerScript = {
-    id: "my-site",
-    etag: "abc123",
+test("summarizeWorker keeps the agent-relevant fields of a Workers-API Worker", () => {
+  const worker: WorkerInfo = {
+    id: "uuid-noise",
+    name: "my-site",
     created_on: "2026-01-01T00:00:00Z",
-    modified_on: "2026-02-01T00:00:00Z",
-    has_assets: true,
-    has_modules: false,
-    usage_model: "standard",
-    placement_mode: "smart",
+    updated_on: "2026-02-01T00:00:00Z",
+    deployed_on: "2026-02-01T00:00:00Z",
     logpush: false,
-    routes: [{ pattern: "example.com/*" }],
+    observability: { enabled: true, head_sampling_rate: 1 },
+    subdomain: { enabled: true, url: "https://my-site.acct.workers.dev" },
+    tags: ["noise"],
   };
 
-  const summary = summarizeWorker(script);
+  const summary = summarizeWorker(worker);
 
   assert.deepEqual(summary, {
     name: "my-site",
     created_on: "2026-01-01T00:00:00Z",
     modified_on: "2026-02-01T00:00:00Z",
-    has_assets: true,
-    has_modules: false,
-    usage_model: "standard",
-    placement_mode: "smart",
+    deployed_on: "2026-02-01T00:00:00Z",
     logpush: false,
+    workers_dev: true,
+    observability: true,
   });
-  // Noise like etag/routes must not leak into the summary.
-  assert.equal("etag" in summary, false);
-  assert.equal("routes" in summary, false);
+  // Noise like the UUID and tags must not leak into the summary.
+  assert.equal("id" in summary, false);
+  assert.equal("tags" in summary, false);
 });
 
-test("summarizeWorker tolerates a minimal script object", () => {
-  const summary = summarizeWorker({ id: "bare" });
+test("summarizeWorker tolerates a minimal Worker object", () => {
+  const summary = summarizeWorker({ id: "uuid", name: "bare" });
   assert.equal(summary.name, "bare");
-  assert.equal(summary.has_assets, undefined);
+  assert.equal(summary.workers_dev, undefined);
 });
 
-test("summarizeVersion pulls the agent-relevant fields out of metadata", () => {
+test("summarizeVersion keeps the agent-relevant fields including the deploy message", () => {
   const version: WorkerVersion = {
     id: "v-uuid-1",
     number: 3,
-    metadata: {
-      author_email: "dev@example.com",
-      author_id: "auth-noise",
-      created_on: "2026-03-01T00:00:00Z",
-      modified_on: "2026-03-01T00:00:00Z",
-      hasPreview: true,
-      source: "api",
-    },
-    resources: { script: { etag: "noise" } },
+    created_on: "2026-03-01T00:00:00Z",
+    author_email: "dev@example.com",
+    author_id: "auth-noise",
+    source: "api",
+    annotations: { "workers/message": "fix login", "workers/tag": "v3" },
+    bindings: [{ type: "plain_text", name: "NOISE", text: "x" }],
   };
 
   const summary = summarizeVersion(version);
@@ -76,14 +71,14 @@ test("summarizeVersion pulls the agent-relevant fields out of metadata", () => {
     created_on: "2026-03-01T00:00:00Z",
     author: "dev@example.com",
     source: "api",
+    message: "fix login",
+    tag: "v3",
   });
-  assert.equal("resources" in summary, false);
+  assert.equal("bindings" in summary, false);
 });
 
-test("summarizeVersion tolerates missing metadata", () => {
-  const summary = summarizeVersion({ id: "v-bare" });
-  assert.equal(summary.id, "v-bare");
-  assert.equal(summary.author, undefined);
+test("summarizeVersion tolerates a bare version", () => {
+  assert.deepEqual(summarizeVersion({ id: "v-bare" }), { id: "v-bare" });
 });
 
 test("summarizeDeployment keeps the version split and drops noise", () => {

@@ -64,7 +64,8 @@ Required for running the server:
 
 ```
 src/
-├── index.ts           # MCP server entry, tool definitions & handlers
+├── index.ts           # stdio entry: loadConfig + serveStdio(() => buildServer(...))
+├── server.ts          # buildServer(): tool schemas, definitions & handlers
 ├── workers/
 │   ├── client.ts      # Cloudflare Workers API HTTP client (WorkersClient)
 │   ├── assets.ts      # Manifest hashing + asset upload-session/bucket flow
@@ -79,10 +80,11 @@ src/
 
 ### Key Patterns
 
-**Tool Structure**: All MCP tools are registered in `src/index.ts` inside
+**Tool Structure**: All MCP tools are registered in `src/server.ts` inside
 `buildServer()` via the high-level `McpServer` + `registerTool` API (SDK v2).
 `serveStdio` calls `buildServer()` once per connection, so it must stay
-synchronous and side-effect free. The `WorkersClient` is built once in
+synchronous and side-effect free (it's also what `test/unit/handlers.test.ts`
+drives over an in-memory transport against a fake Cloudflare API). The `WorkersClient` is built once in
 `main()` and shared. Each tool has a single source of
 truth — one Zod schema — wired up through the local `addTool(name, config, handler)`
 helper, which:
@@ -116,13 +118,19 @@ renames a tool.
 
 Base URL: `https://api.cloudflare.com/client/v4/accounts/{account_id}/workers`
 
-This server uses the **legacy Scripts API** for script lifecycle. It is now
-tagged deprecated in Cloudflare's OpenAPI schema but has no sunset date. The
-exceptions are the Worker Previews tools, which use the GA **Workers API**
-(`/workers/workers/{name}`; names work as ids). Secrets, tail, deployments,
-cron, domains, asset upload and telemetry are on GA scripts-path endpoints.
-The rationale, endpoint docs, asset-upload protocol, and the staged migration
-plan off the deprecated endpoints (§10) live in `IMPLEMENTATION_PLAN.md`.
+Workers, versions and previews use the GA **Workers API**
+(`/workers/workers/{name}`; names work as ids). Deployments, cron, domains,
+secrets, tails, asset upload and telemetry use GA scripts-path endpoints. The
+only deprecated legacy call left is the content download. It is the
+`get_worker_code` fallback for service-worker-syntax Workers, which have no
+modules on the new API.
+
+Invariants for anything touching versions (`IMPLEMENTATION_PLAN.md` §10):
+- **`versions/latest` means newest *created*, not live.** Merge-patch it
+  only after `assertLatestIsLive`. Read "the deployed version" via
+  `/deployments`, never via `latest`.
+- **New-API versions drop unlisted bindings, secrets included.** Any version
+  you create with bindings must go through `withInheritedSecrets`.
 
 ## Toolchain constraints (do not "fix" these)
 

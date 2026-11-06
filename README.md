@@ -35,19 +35,19 @@ so this server's headline feature is:
 ## Tools
 
 ### Static sites (the differentiator)
-- **deploy_static_site** - Deploy a local directory as a static site: manifest hashing, server-side dedupe (unchanged files never re-upload), `_headers`/`_redirects` support, SPA/404 handling, `base_path` URL prefix (where Cloudflare has enabled it for the account), live workers.dev URL in the result
-- **redeploy_assets** - Redeploy reusing already-uploaded files and asset config (`keep_assets`), e.g. to bump the compatibility date. To change `html_handling`/`not_found_handling`/`base_path`, re-run `deploy_static_site`: unchanged files dedupe, so nothing re-uploads
+- **deploy_static_site** - Deploy a local directory as a static site: manifest hashing, server-side dedupe (unchanged files never re-upload), `_headers`/`_redirects` support, SPA/404 handling, `base_path` URL prefix (where Cloudflare has enabled it for the account), live workers.dev URL in the result. Deploying over a Worker that has code replaces it with assets only, which removes its bindings and secrets (the result lists them in `secrets_dropped`)
+- **redeploy_assets** - Redeploy reusing the live version's files and asset config, e.g. to bump the compatibility date. To change `html_handling`/`not_found_handling`/`base_path`, re-run `deploy_static_site`: unchanged files dedupe, so nothing re-uploads
 
 ### Previews (beta)
 - **deploy_preview** - Deploy a preview of a site directory or Worker code without touching production, at a stable `https://<preview>-<worker>.<account>.workers.dev` URL plus a per-deployment URL. Redeploying the same `preview_name` updates it
 - **list_previews / delete_preview** - List a Worker's previews with their URLs, or delete one by name
 
 ### Workers
-- **list_workers** - List all Worker scripts in your account
+- **list_workers** - List all Workers in your account with created/modified/last-deployed times and workers.dev/observability status
 - **get_worker** - Settings (bindings, compat date/flags, placement, observability) plus cron triggers and workers.dev status
 - **get_worker_code** - Download a Worker's deployed source (all modules)
-- **deploy_worker** - Upload and deploy ES-module Workers with bindings (`plain_text`, `secret_text`, `kv_namespace`, `r2_bucket`, `d1`, `assets`)
-- **update_worker_settings** - Change bindings/compat/logpush/observability without re-uploading code
+- **deploy_worker** - Upload and deploy ES-module Workers with bindings (`plain_text`, `secret_text`, `kv_namespace`, `r2_bucket`, `d1`, `assets`). Existing secrets are kept across redeploys
+- **update_worker_settings** - Change bindings/compat/logpush/observability without re-uploading code (existing secrets are kept unless listed)
 - **delete_worker** - Permanently delete a Worker (optional `force`)
 
 ### Secrets
@@ -187,6 +187,15 @@ Rotate STRIPE_KEY on my-api and remove the old LEGACY_TOKEN secret
 - Rollbacks reach the 100 most recent versions and never revert data in
   bound resources (KV, R2, D1); a changed secret blocks rollback unless
   `force` is set.
+- Tools that build on the current version (`redeploy_assets`,
+  `deploy_worker`/`create_version` with `keep_assets`, and binding or
+  compatibility changes in `update_worker_settings`) **refuse while a
+  staged version or a gradual rollout is pending**. Otherwise the staged code
+  would silently become the base. Deploy or roll back first with
+  `create_deployment`.
+- Cloudflare also blocks secret edits while the newest version isn't the
+  deployed one, for example right after a rollback (error 10215). Redeploy with
+  `deploy_worker` or deploy the newest version, then retry.
 
 ### Domains & serving
 - Custom domains require the zone to be **active in the same Cloudflare

@@ -17,60 +17,80 @@ function makeClient(): WorkersClient {
   return new WorkersClient("test-token", ACCOUNT);
 }
 
-test("uploadScript PUTs FormData through without forcing a JSON content type", async () => {
+test("createVersion POSTs a JSON version body and only sends deploy=true when deploying", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ id: "my-worker", etag: "etag-1" }));
-
-    const form = new FormData();
-    form.append(
-      "metadata",
-      new File([JSON.stringify({ main_module: "index.js" })], "metadata.json", {
-        type: "application/json",
-      })
-    );
-    form.append(
-      "index.js",
-      new File(["export default {}"], "index.js", { type: "application/javascript+module" })
-    );
+    mock.enqueue(cfOk({ id: "v-1", number: 1 }));
+    mock.enqueue(cfOk({ id: "v-2", number: 2 }));
 
     const client = makeClient();
-    const response = await client.uploadScript("my worker", form);
+    const body = {
+      main_module: "index.js",
+      compatibility_date: "2026-11-05",
+      modules: [{ name: "index.js", content_type: "application/javascript+module", content_base64: "eA==" }],
+    };
+    await client.createVersion("my worker", body, true);
+    await client.createVersion("my worker", body, false);
 
-    assert.equal(mock.calls[0].method, "PUT");
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my%20worker`);
-    // fetch must set the multipart boundary itself.
-    assert.equal("Content-Type" in mock.calls[0].headers, false);
-    assert.ok(mock.calls[0].body instanceof FormData);
-    assert.equal(response.result.etag, "etag-1");
+    assert.equal(mock.calls[0].method, "POST");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/my%20worker/versions?deploy=true`);
+    assert.equal(mock.calls[0].headers["Content-Type"], "application/json");
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), body);
+    assert.equal(mock.calls[1].url, `${BASE}/workers/workers/my%20worker/versions`);
   } finally {
     mock.restore();
   }
 });
 
-test("patchWorkerSettings sends multipart with a single settings JSON part", async () => {
+test("patchLatestVersion merge-patches /versions/latest and getLatestVersion reads it", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ compatibility_date: "2026-07-01" }));
+    mock.enqueue(cfOk({ id: "v-3" }));
+    mock.enqueue(cfOk({ id: "v-3" }));
 
     const client = makeClient();
-    await client.patchWorkerSettings("my-worker", { compatibility_date: "2026-07-01" });
+    await client.patchLatestVersion("w", { compatibility_date: "2026-11-05" }, true);
+    const latest = await client.getLatestVersion("w");
 
     assert.equal(mock.calls[0].method, "PATCH");
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/settings`);
-    assert.ok(mock.calls[0].body instanceof FormData);
-    const form = mock.calls[0].body as FormData;
-    const part = form.get("settings");
-    assert.ok(part instanceof File);
-    assert.deepEqual(JSON.parse(await part.text()), { compatibility_date: "2026-07-01" });
-    // Exactly one part: the settings JSON.
-    assert.deepEqual([...form.keys()], ["settings"]);
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/w/versions/latest?deploy=true`);
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), { compatibility_date: "2026-11-05" });
+    assert.equal(mock.calls[1].method, "GET");
+    assert.equal(mock.calls[1].url, `${BASE}/workers/workers/w/versions/latest`);
+    assert.equal(latest.result.id, "v-3");
   } finally {
     mock.restore();
   }
 });
 
-test("deleteWorker targets the script endpoint and only sends force when set", async () => {
+test("createWorker POSTs the name plus settings; patchWorker PATCHes Worker-level fields", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "uuid", name: "new-site" }));
+    mock.enqueue(cfOk({ id: "uuid", name: "new-site" }));
+
+    const client = makeClient();
+    await client.createWorker("new-site", { subdomain: { enabled: true } });
+    await client.patchWorker("new-site", { observability: { enabled: true }, logpush: false });
+
+    assert.equal(mock.calls[0].method, "POST");
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers`);
+    assert.deepEqual(JSON.parse(mock.calls[0].body as string), {
+      name: "new-site",
+      subdomain: { enabled: true },
+    });
+    assert.equal(mock.calls[1].method, "PATCH");
+    assert.equal(mock.calls[1].url, `${BASE}/workers/workers/new-site`);
+    assert.deepEqual(JSON.parse(mock.calls[1].body as string), {
+      observability: { enabled: true },
+      logpush: false,
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("deleteWorker targets the Workers API endpoint and only sends force when set", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue(cfOk(null));
@@ -81,33 +101,22 @@ test("deleteWorker targets the script endpoint and only sends force when set", a
     await client.deleteWorker("doomed", true);
 
     assert.equal(mock.calls[0].method, "DELETE");
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/doomed`);
-    assert.equal(mock.calls[1].url, `${BASE}/workers/scripts/doomed?force=true`);
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/doomed`);
+    assert.equal(mock.calls[1].url, `${BASE}/workers/workers/doomed?force=true`);
   } finally {
     mock.restore();
   }
 });
 
-test("createVersion POSTs multipart to /versions", async () => {
+test("listVersions asks for one page of up to 100 versions", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ id: "v-new", number: 4 }));
+    mock.enqueue(cfOk([{ id: "v-2", number: 2 }, { id: "v-1", number: 1 }]));
 
-    const form = new FormData();
-    form.append(
-      "metadata",
-      new File([JSON.stringify({ main_module: "index.js" })], "metadata.json", {
-        type: "application/json",
-      })
-    );
+    const response = await makeClient().listVersions("w");
 
-    const client = makeClient();
-    const response = await client.createVersion("my-worker", form);
-
-    assert.equal(mock.calls[0].method, "POST");
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/versions`);
-    assert.ok(mock.calls[0].body instanceof FormData);
-    assert.equal(response.result.number, 4);
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/w/versions?per_page=100`);
+    assert.equal(response.result.length, 2);
   } finally {
     mock.restore();
   }
@@ -144,16 +153,20 @@ test("createDeployment POSTs the percentage strategy and only sends force when s
   }
 });
 
-test("getVersion targets the version-detail endpoint", async () => {
+test("getVersion targets the version-detail endpoint and only includes modules on request", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ id: "v-1", number: 1, resources: { bindings: [] } }));
+    mock.enqueue(cfOk({ id: "v-1", number: 1, bindings: [] }));
+    mock.enqueue(cfOk({ id: "v-1", modules: [{ name: "index.js", content_type: "x", content_base64: "eA==" }] }));
 
     const client = makeClient();
-    const response = await client.getVersion("my-worker", "v-1");
+    const meta = await client.getVersion("my-worker", "v-1");
+    const withCode = await client.getVersion("my-worker", "v-1", true);
 
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/versions/v-1`);
-    assert.deepEqual(response.result.resources, { bindings: [] });
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/my-worker/versions/v-1`);
+    assert.deepEqual(meta.result.bindings, []);
+    assert.equal(mock.calls[1].url, `${BASE}/workers/workers/my-worker/versions/v-1?include=modules`);
+    assert.equal(withCode.result.modules?.[0].name, "index.js");
   } finally {
     mock.restore();
   }
@@ -195,27 +208,6 @@ test("attachDomain PUTs to /workers/domains and detachDomain DELETEs by ID", asy
     });
     assert.equal(mock.calls[1].method, "DELETE");
     assert.equal(mock.calls[1].url, `${BASE}/workers/domains/dom-1`);
-  } finally {
-    mock.restore();
-  }
-});
-
-test("setScriptSubdomain POSTs enabled (and previews only when specified)", async () => {
-  const mock = installMockFetch();
-  try {
-    mock.enqueue(cfOk({ enabled: true }));
-    mock.enqueue(cfOk({ enabled: true, previews_enabled: true }));
-
-    const client = makeClient();
-    await client.setScriptSubdomain("my-worker", true);
-    await client.setScriptSubdomain("my-worker", true, true);
-
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/subdomain`);
-    assert.deepEqual(JSON.parse(mock.calls[0].body as string), { enabled: true });
-    assert.deepEqual(JSON.parse(mock.calls[1].body as string), {
-      enabled: true,
-      previews_enabled: true,
-    });
   } finally {
     mock.restore();
   }

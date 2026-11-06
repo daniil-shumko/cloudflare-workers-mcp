@@ -42,7 +42,7 @@ subdomain settings *are* covered, as a field on the beta Worker object).
 | Base | `/accounts/{account_id}/workers/scripts/{script_name}` | `/accounts/{account_id}/workers/workers/{worker_id}` |
 | Model | script name is the key | Worker (stable UUID) → Version (immutable) → Deployment |
 | Script upload | multipart form: `metadata` JSON part + one part per module | pure JSON; modules as `{name, content_type, content_base64}`; `?deploy=true` deploys in one call |
-| Status | working; **tagged `deprecated` in the OpenAPI schema** (as of 2026-11-05, SDK group `workers.legacy.scripts`) for `GET /scripts`, `GET/PUT/DELETE /scripts/{name}`, `/settings`, `/subdomain`, `/versions` — no `deprecated: true` flag, no sunset date, no changelog post, not on the API deprecations page. `/deployments`, `/schedules`, `/secrets`, asset upload, `/domains`, account `/subdomain`, telemetry stay GA | **GA** (`x-fern-availability: generally-available`, seen 2026-11-05); beta since 2025-09-03 |
+| Status | no longer used except the SW-syntax content download (migrated 2026-11-06); **tagged `deprecated` in the OpenAPI schema** (as of 2026-11-05, SDK group `workers.legacy.scripts`) for `GET /scripts`, `GET/PUT/DELETE /scripts/{name}`, `/settings`, `/subdomain`, `/versions` — no `deprecated: true` flag, no sunset date, no changelog post, not on the API deprecations page. `/deployments`, `/schedules`, `/secrets`, asset upload, `/domains`, account `/subdomain`, telemetry stay GA | **GA** (`x-fern-availability: generally-available`, seen 2026-11-05); beta since 2025-09-03 |
 | Coverage | everything below | script/version/deployment + subdomain `{enabled, previews_enabled}` on the Worker object + Worker Previews (beta) — no cron, no custom-domain attach |
 
 **Migration watch (2026-11-05):** nothing forces a move yet, but the
@@ -240,7 +240,8 @@ responses, `readOnlyHint`/`destructiveHint` annotations on every tool.
 
 ```
 src/
-├── index.ts             # MCP server entry; addTool(name, config, handler) helper —
+├── index.ts             # stdio entry (loadConfig + serveStdio)
+├── server.ts            # buildServer(); addTool(name, config, handler) helper —
 │                        #   one Zod schema per tool, SDK validates, z.infer types args
 ├── workers/
 │   ├── client.ts        # WorkersClient (Bearer auth, rate-limited, CloudflareAPIError)
@@ -328,7 +329,40 @@ Added 2026-11-05:
     and per deployment `https://<id8>-…`. Production deployments are never
     touched.
 
-### Migrating off the deprecated legacy endpoints: assessment
+### Migration off the deprecated legacy endpoints: DONE (2026-11-06)
+
+The plan below was executed in one pass (v1.3.0). Probes against the live API
+settled every open question:
+
+- **Assets-only production versions work** on the new API (no modules,
+  `assets{jwt, config}`), and `config._headers` applies.
+- **`PATCH …/versions/latest` inherits assets and asset config.** That's the
+  `keep_assets` substitute, so blocker 1 is resolved. Code swaps through it
+  keep assets too.
+- **`latest` is the newest *created* version.** A staged `create_version`
+  becomes latest, and preview deployments do not.
+  `assertLatestIsLive` guards every merge-patch.
+- **Secrets:** legacy `PUT /scripts` kept existing secrets implicitly. New-API
+  versions drop every unlisted binding. `withInheritedSecrets` adds
+  `{type: "inherit", name, version_id: <live>}` for each secret the caller
+  didn't set. Pinning `version_id` works on the new API's version endpoints.
+- **An assets-only version holds no bindings at all.** Cloudflare silently
+  drops every binding (inherit and plain_text alike) on a version without
+  modules, so `deploy_static_site` over a code Worker loses its secrets. The
+  tool reports `secrets_dropped` with a warning instead of pretending to keep
+  them (probed live 2026-11-06).
+- **Cloudflare refuses secret edits (10215)** while latest isn't deployed, for
+  example after `rollback_worker`. The fix is a full redeploy, or deploying
+  latest.
+- **Service-worker-syntax Workers return no `modules`.** `get_worker_code`
+  falls back to the legacy content download, the only deprecated call left.
+- `POST /workers/workers {name}` creates a Worker with workers.dev
+  **disabled**. We pass `subdomain.enabled` at creation to keep the
+  "new Workers are served on workers.dev" behavior.
+- Lists paginate with a maximum per_page of 100. `listWorkers` walks all
+  pages; `listVersions` reads the 100 newest.
+
+Original assessment, kept for the record:
 **Effort: moderate, about 2–3 focused days.** 11 of the 24 `WorkersClient`
 methods change, and 13 stay on GA scripts-path endpoints: deployments (and
 so rollback), schedules, domains, account subdomain, asset upload, telemetry,

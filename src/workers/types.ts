@@ -22,40 +22,39 @@ export interface ResultInfo {
   total_pages?: number;
 }
 
-/**
- * A Worker script as returned by GET /accounts/{account_id}/workers/scripts
- * (legacy Scripts API). Fields other than `id` are optional defensively —
- * the API omits several of them depending on the Worker's configuration.
- */
-export interface WorkerScript {
-  id: string;
-  etag?: string;
-  created_on?: string;
-  modified_on?: string;
-  usage_model?: string;
-  logpush?: boolean;
-  has_assets?: boolean;
-  has_modules?: boolean;
-  placement_mode?: string;
-  last_deployed_from?: string;
-  tail_consumers?: Array<{ service: string; environment?: string; namespace?: string }> | null;
-  routes?: Array<{ id?: string; pattern?: string; zone_name?: string }> | null;
+/** workers.dev subdomain settings on a Worker (Workers API). */
+export interface WorkerSubdomain {
+  enabled?: boolean;
+  previews_enabled?: boolean;
+  /** Read-only: https://<name>.<account>.workers.dev */
+  url?: string;
+  /** Read-only: suffix appended to preview slugs / version ids for preview URLs. */
+  preview_url_suffix?: string;
 }
 
 /**
- * Script settings from GET /accounts/{account_id}/workers/scripts/{script_name}/settings.
- * Bindings are kept loosely typed until the deploy tools land (35+ binding
- * variants; see IMPLEMENTATION_PLAN.md).
+ * A Worker as returned by the Workers API (GET/POST/PATCH
+ * /accounts/{account_id}/workers/workers[/{name}]). Holds Worker-level
+ * settings; code, bindings and compatibility live on versions.
  */
-export interface WorkerScriptSettings {
-  bindings?: Array<Record<string, unknown>>;
-  compatibility_date?: string;
-  compatibility_flags?: string[];
-  usage_model?: string;
+export interface WorkerInfo {
+  id: string;
+  name: string;
+  created_on?: string;
+  updated_on?: string;
+  deployed_on?: string | null;
   logpush?: boolean;
-  placement?: { mode?: string };
-  tail_consumers?: Array<{ service: string; environment?: string; namespace?: string }> | null;
   observability?: Record<string, unknown>;
+  subdomain?: WorkerSubdomain;
+  tags?: string[];
+  tail_consumers?: Array<{ name?: string; service?: string; environment?: string; namespace?: string }>;
+}
+
+/** Partial update for PATCH /workers/workers/{name} (omitted fields unchanged). */
+export interface WorkerPatch {
+  logpush?: boolean;
+  observability?: { enabled: boolean; head_sampling_rate?: number };
+  subdomain?: { enabled: boolean; previews_enabled?: boolean };
 }
 
 /**
@@ -69,32 +68,38 @@ export interface WorkerModule {
   content: string;
 }
 
+/** A module as stored on a version (base64 content, Workers API). */
+export interface VersionModule {
+  name: string;
+  content_type: string;
+  content_base64: string;
+}
+
 /**
- * A Worker version from GET .../scripts/{name}/versions (list) or
- * /{version_id} (detail). Annotations ("workers/message" etc.) are accepted on
- * version *upload* but are not returned by the documented read endpoints.
+ * A Worker version from the Workers API (GET/POST
+ * /workers/workers/{name}/versions[/{id}], PATCH .../versions/latest).
+ * Fields are flat; `modules` is present only with ?include=modules.
  */
 export interface WorkerVersion {
   id: string;
   number?: number;
-  metadata?: {
-    author_email?: string;
-    author_id?: string;
-    created_on?: string;
-    modified_on?: string;
-    /** camelCase in the API response. */
-    hasPreview?: boolean;
-    source?: string;
-    [key: string]: unknown;
-  };
-  /** Present on the version-detail and create-version endpoints only: bindings, script, script_runtime. */
-  resources?: Record<string, unknown>;
+  created_on?: string;
+  author_email?: string;
+  author_id?: string;
+  /** How the version was created: api | wrangler | terraform | dash | … */
+  source?: string;
+  annotations?: { "workers/message"?: string; "workers/tag"?: string; [key: string]: unknown };
+  main_module?: string;
+  compatibility_date?: string;
+  compatibility_flags?: string[];
+  bindings?: Array<Record<string, unknown>>;
+  assets?: { config?: AssetsConfig; [key: string]: unknown };
+  placement?: Record<string, unknown>;
+  limits?: Record<string, unknown>;
+  usage_model?: string;
+  modules?: VersionModule[];
+  urls?: string[];
   startup_time_ms?: number;
-}
-
-/** Versions list responses wrap the array in { items }. */
-export interface WorkerVersionList {
-  items?: WorkerVersion[];
 }
 
 export interface WorkerDeployment {
@@ -132,12 +137,6 @@ export interface WorkerDomain {
   hostname?: string;
   service?: string;
   environment?: string;
-}
-
-/** Per-script workers.dev subdomain config (GET/POST .../scripts/{name}/subdomain). */
-export interface ScriptSubdomain {
-  enabled?: boolean;
-  previews_enabled?: boolean;
 }
 
 /** Account-level workers.dev subdomain (GET/PUT /workers/subdomain). */
@@ -248,25 +247,6 @@ export interface TelemetryQueryResult {
   [key: string]: unknown;
 }
 
-/**
- * The `metadata` part of a script/version multipart upload. Only the fields
- * this server sends are typed; the API accepts more (IMPLEMENTATION_PLAN.md §3).
- */
-export interface ScriptUploadMetadata {
-  main_module?: string;
-  bindings?: Array<Record<string, unknown>>;
-  compatibility_date?: string;
-  compatibility_flags?: string[];
-  assets?: { jwt?: string; config?: AssetsConfig };
-  keep_assets?: boolean;
-  migrations?: Record<string, unknown>;
-  logpush?: boolean;
-  tail_consumers?: Array<{ service: string; environment?: string; namespace?: string }>;
-  placement?: { mode?: string };
-  observability?: { enabled: boolean; head_sampling_rate?: number };
-  annotations?: { "workers/message"?: string; "workers/tag"?: string };
-}
-
 /** A secret binding as returned by the secrets endpoints (never includes the value). */
 export interface WorkerSecret {
   name: string;
@@ -323,12 +303,20 @@ export interface PreviewDeployment {
   created_on?: string;
 }
 
-/** Request body for POST .../previews/{id}/deployments (JSON, base64 modules). */
-export interface PreviewDeploymentBody {
+/**
+ * JSON body for creating a version (POST .../versions), patching latest
+ * (PATCH .../versions/latest, merge-patch: omitted fields inherit) and preview
+ * deployments. Modules are base64.
+ */
+export interface VersionBody {
   main_module?: string;
   modules?: Array<{ name: string; content_type: string; content_base64: string }>;
   bindings?: Array<Record<string, unknown>>;
   compatibility_date?: string;
   compatibility_flags?: string[];
   assets?: { jwt: string; config?: AssetsConfig };
+  /** null clears an inherited annotation when merge-patching latest. */
+  annotations?: { "workers/message"?: string | null; "workers/tag"?: string | null };
 }
+
+export type PreviewDeploymentBody = VersionBody;

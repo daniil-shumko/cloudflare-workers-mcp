@@ -85,6 +85,18 @@ test("formatError code 100343 explains that base_path is gated for the account",
   assert.ok(result.suggestion?.includes("base_path isn't enabled"));
 });
 
+test("formatError code 10215 explains that secret edits need the latest version deployed", () => {
+  const result = formatError(
+    new CloudflareAPIError(
+      [{ code: 10215, message: "Secret edit failed. ... the latest version of your Worker isn't currently deployed." }],
+      400
+    )
+  );
+  assert.equal(result.code, "CF_10215");
+  assert.match(result.suggestion ?? "", /create_deployment/);
+  assert.match(result.suggestion ?? "", /deploy_worker/);
+});
+
 test("formatError handles a plain Error", () => {
   const result = formatError(new Error("boom"));
   assert.equal(result.error, true);

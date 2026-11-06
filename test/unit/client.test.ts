@@ -15,51 +15,67 @@ test("constructor rejects missing token and account id", () => {
   assert.throws(() => new WorkersClient("tok", ""), /account ID is required/);
 });
 
-test("listWorkers hits the scripts endpoint with a bearer token and parses the result", async () => {
+test("listWorkers hits the Workers API with a bearer token and returns the Workers", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue(
       cfOk([
-        { id: "my-site", created_on: "2026-01-01T00:00:00Z", has_assets: true },
-        { id: "api-worker", has_modules: true },
+        { id: "uuid-1", name: "my-site", created_on: "2026-01-01T00:00:00Z" },
+        { id: "uuid-2", name: "api-worker" },
       ])
     );
 
     const client = makeClient();
-    const response = await client.listWorkers();
+    const workers = await client.listWorkers();
 
     assert.equal(mock.calls.length, 1);
     assert.equal(mock.calls[0].method, "GET");
     assert.equal(
       mock.calls[0].url,
-      `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/workers/scripts`
+      `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/workers/workers?page=1&per_page=100`
     );
     assert.equal(mock.calls[0].headers.Authorization, "Bearer test-token");
     // GET requests must not claim a JSON body.
     assert.equal("Content-Type" in mock.calls[0].headers, false);
-
-    assert.equal(response.success, true);
-    assert.equal(response.result.length, 2);
-    assert.equal(response.result[0].id, "my-site");
-    assert.equal(response.result[0].has_assets, true);
+    assert.deepEqual(
+      workers.map((w) => w.name),
+      ["my-site", "api-worker"]
+    );
   } finally {
     mock.restore();
   }
 });
 
-test("getWorkerSettings URL-encodes the script name and targets /settings", async () => {
+test("listWorkers walks every page until a short page", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ compatibility_date: "2026-01-01", bindings: [] }));
+    const page = (n: number, offset: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: `id-${offset + i}`, name: `w-${offset + i}` }));
+    mock.enqueue(cfOk(page(100, 0)));
+    mock.enqueue(cfOk(page(3, 100)));
 
-    const client = makeClient();
-    const response = await client.getWorkerSettings("my worker");
+    const workers = await makeClient().listWorkers();
+
+    assert.equal(workers.length, 103);
+    assert.equal(mock.calls.length, 2);
+    assert.match(mock.calls[1].url, /page=2&per_page=100$/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getWorker URL-encodes the Worker name and targets /workers/workers/{name}", async () => {
+  const mock = installMockFetch();
+  try {
+    mock.enqueue(cfOk({ id: "uuid", name: "my worker", subdomain: { enabled: true } }));
+
+    const response = await makeClient().getWorker("my worker");
 
     assert.equal(
       mock.calls[0].url,
-      `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/workers/scripts/my%20worker/settings`
+      `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/workers/workers/my%20worker`
     );
-    assert.equal(response.result.compatibility_date, "2026-01-01");
+    assert.equal(response.result.subdomain?.enabled, true);
   } finally {
     mock.restore();
   }
@@ -72,7 +88,7 @@ test("a Cloudflare error envelope becomes a CloudflareAPIError with code and sta
 
     const client = makeClient();
     await assert.rejects(
-      () => client.getWorkerSettings("nope"),
+      () => client.getWorker("nope"),
       (err: unknown) => {
         assert.ok(err instanceof CloudflareAPIError);
         assert.equal(err.statusCode, 404);

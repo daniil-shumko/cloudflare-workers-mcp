@@ -16,7 +16,7 @@ function makeClient(): WorkersClient {
   return new WorkersClient("test-token", ACCOUNT);
 }
 
-test("downloadWorkerCode returns a single module for a plain-script response", async () => {
+test("downloadLegacyScript returns a single module for a plain-script response", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue({
@@ -26,7 +26,7 @@ test("downloadWorkerCode returns a single module for a plain-script response", a
     });
 
     const client = makeClient();
-    const { contentType, modules } = await client.downloadWorkerCode("my-worker");
+    const { contentType, modules } = await client.downloadLegacyScript("my-worker");
 
     assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker`);
     assert.equal(contentType, "application/javascript");
@@ -38,7 +38,7 @@ test("downloadWorkerCode returns a single module for a plain-script response", a
   }
 });
 
-test("downloadWorkerCode parses a multipart module response into one module per part", async () => {
+test("downloadLegacyScript parses a multipart module response into one module per part", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue({
@@ -51,7 +51,7 @@ test("downloadWorkerCode parses a multipart module response into one module per 
     });
 
     const client = makeClient();
-    const { modules } = await client.downloadWorkerCode("mod-worker");
+    const { modules } = await client.downloadLegacyScript("mod-worker");
 
     assert.equal(modules.length, 2);
     assert.deepEqual(
@@ -66,7 +66,7 @@ test("downloadWorkerCode parses a multipart module response into one module per 
   }
 });
 
-test("downloadWorkerCode handles filename-less multipart parts as string entries (undici behavior)", async () => {
+test("downloadLegacyScript handles filename-less multipart parts as string entries (undici behavior)", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue({
@@ -76,7 +76,7 @@ test("downloadWorkerCode handles filename-less multipart parts as string entries
     });
 
     const client = makeClient();
-    const { modules } = await client.downloadWorkerCode("mod-worker");
+    const { modules } = await client.downloadLegacyScript("mod-worker");
 
     assert.equal(modules.length, 1);
     assert.equal(modules[0].name, "index.js");
@@ -88,14 +88,14 @@ test("downloadWorkerCode handles filename-less multipart parts as string entries
   }
 });
 
-test("downloadWorkerCode surfaces the JSON error envelope on failure", async () => {
+test("downloadLegacyScript surfaces the JSON error envelope on failure", async () => {
   const mock = installMockFetch();
   try {
     mock.enqueue(cfErr(404, 10007, "workers.api.error.script_not_found"));
 
     const client = makeClient();
     await assert.rejects(
-      () => client.downloadWorkerCode("nope"),
+      () => client.downloadLegacyScript("nope"),
       (err: unknown) => {
         assert.ok(err instanceof CloudflareAPIError);
         assert.equal(err.statusCode, 404);
@@ -108,19 +108,19 @@ test("downloadWorkerCode surfaces the JSON error envelope on failure", async () 
   }
 });
 
-test("listVersions and listDeployments target the versions/deployments endpoints", async () => {
+test("listVersions uses the Workers API while listDeployments stays on the GA scripts path", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ items: [{ id: "v1", number: 1 }] }));
+    mock.enqueue(cfOk([{ id: "v1", number: 1 }]));
     mock.enqueue(cfOk({ deployments: [{ id: "d1", strategy: "percentage" }] }));
 
     const client = makeClient();
     const versions = await client.listVersions("my worker");
     const deployments = await client.listDeployments("my worker");
 
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my%20worker/versions`);
+    assert.equal(mock.calls[0].url, `${BASE}/workers/workers/my%20worker/versions?per_page=100`);
     assert.equal(mock.calls[1].url, `${BASE}/workers/scripts/my%20worker/deployments`);
-    assert.deepEqual(versions.result, { items: [{ id: "v1", number: 1 }] });
+    assert.deepEqual(versions.result, [{ id: "v1", number: 1 }]);
     assert.equal(deployments.result.deployments?.[0].id, "d1");
   } finally {
     mock.restore();
@@ -196,21 +196,17 @@ test("queryTelemetry POSTs the query body to the telemetry endpoint", async () =
   }
 });
 
-test("subdomain getters target the script and account subdomain endpoints", async () => {
+test("the account subdomain getter targets /workers/subdomain", async () => {
   const mock = installMockFetch();
   try {
-    mock.enqueue(cfOk({ enabled: true, previews_enabled: false }));
     mock.enqueue(cfOk({ subdomain: "my-team" }));
 
-    const client = makeClient();
-    const script = await client.getScriptSubdomain("my-worker");
-    const account = await client.getAccountSubdomain();
+    const account = await makeClient().getAccountSubdomain();
 
-    assert.equal(mock.calls[0].url, `${BASE}/workers/scripts/my-worker/subdomain`);
-    assert.equal(mock.calls[1].url, `${BASE}/workers/subdomain`);
-    assert.equal(script.result.enabled, true);
+    assert.equal(mock.calls[0].url, `${BASE}/workers/subdomain`);
     assert.equal(account.result.subdomain, "my-team");
   } finally {
     mock.restore();
   }
 });
+
