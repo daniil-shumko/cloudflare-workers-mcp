@@ -87,6 +87,13 @@ function getSuggestionForError(error: CloudflareAPIError): string | undefined {
     return "A non-root base_path isn't enabled for this Cloudflare account yet. Deploy without base_path (serves at '/'), or route a path prefix to a Worker instead.";
   }
 
+  // 10215: secret edits are refused while the newest version isn't the
+  // deployed one, e.g. after rollback_worker or a staged create_version
+  // (observed 2026-11-06).
+  if (errorCode === 10215) {
+    return "The Worker's newest version isn't the deployed one (for example after a rollback or a staged create_version), so Cloudflare blocks secret edits. Deploy the newest version with create_deployment, or redeploy the code with deploy_worker, then retry.";
+  }
+
   // Not found errors
   if (errorCode === 7000 || errorMessage.includes("not found")) {
     return "The requested resource was not found. Use list_workers to find valid Worker names.";

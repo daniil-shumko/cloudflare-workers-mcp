@@ -8,7 +8,7 @@ import type {
   TelemetryEvent,
   WorkerDeployment,
   WorkerDomain,
-  WorkerScript,
+  WorkerInfo,
   WorkerVersion,
 } from "./types.js";
 
@@ -16,23 +16,23 @@ export interface WorkerSummary {
   name: string;
   created_on?: string;
   modified_on?: string;
-  has_assets?: boolean;
-  has_modules?: boolean;
-  usage_model?: string;
-  placement_mode?: string;
+  /** null when the Worker exists but has never been deployed. */
+  deployed_on?: string | null;
   logpush?: boolean;
+  /** Served on <name>.<account>.workers.dev */
+  workers_dev?: boolean;
+  observability?: boolean;
 }
 
-export function summarizeWorker(script: WorkerScript): WorkerSummary {
+export function summarizeWorker(worker: WorkerInfo): WorkerSummary {
   return {
-    name: script.id,
-    created_on: script.created_on,
-    modified_on: script.modified_on,
-    has_assets: script.has_assets,
-    has_modules: script.has_modules,
-    usage_model: script.usage_model,
-    placement_mode: script.placement_mode,
-    logpush: script.logpush,
+    name: worker.name,
+    created_on: worker.created_on,
+    modified_on: worker.updated_on,
+    deployed_on: worker.deployed_on,
+    logpush: worker.logpush,
+    workers_dev: worker.subdomain?.enabled,
+    observability: typeof worker.observability?.enabled === "boolean" ? (worker.observability.enabled as boolean) : undefined,
   };
 }
 
@@ -43,18 +43,23 @@ export interface VersionSummary {
   author?: string;
   /** How the version was created: api | wrangler | terraform | dash | … */
   source?: string;
+  /** The workers/message annotation (deploy message), when set. */
+  message?: string;
+  /** The workers/tag annotation, when set. */
+  tag?: string;
 }
 
-// Version annotations (workers/message etc.) are write-only on upload — the
-// read endpoints never return them, so the summary doesn't carry them.
 export function summarizeVersion(version: WorkerVersion): VersionSummary {
-  return {
+  const summary: VersionSummary = {
     id: version.id,
     number: version.number,
-    created_on: version.metadata?.created_on,
-    author: version.metadata?.author_email,
-    source: version.metadata?.source,
+    created_on: version.created_on,
+    author: version.author_email,
+    source: version.source,
+    message: version.annotations?.["workers/message"],
+    tag: version.annotations?.["workers/tag"],
   };
+  return Object.fromEntries(Object.entries(summary).filter(([, v]) => v !== undefined)) as VersionSummary;
 }
 
 export interface DeploymentSummary {

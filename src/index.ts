@@ -36,8 +36,11 @@ import {
 } from "./workers/summarize.js";
 import type {
   AssetsConfig,
-  PreviewDeploymentBody,
-  ScriptUploadMetadata,
+  VersionBody,
+  VersionModule,
+  WorkerInfo,
+  WorkerModule,
+  WorkerPatch,
   WorkerPreview,
   WorkerVersion,
 } from "./workers/types.js";
@@ -479,31 +482,6 @@ function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * Build the multipart body for a script upload: a `metadata` JSON part plus
- * one part per module (none for an assets-only Worker). Module part names are
- * the filenames that metadata.main_module references.
- */
-function scriptUploadForm(
-  metadata: ScriptUploadMetadata,
-  modules: Array<{ name: string; content: string; content_type?: string }> = []
-): FormData {
-  const form = new FormData();
-  form.append(
-    "metadata",
-    new File([JSON.stringify(metadata)], "metadata.json", { type: "application/json" })
-  );
-  for (const mod of modules) {
-    form.append(
-      mod.name,
-      new File([mod.content], mod.name, {
-        type: mod.content_type ?? "application/javascript+module",
-      })
-    );
-  }
-  return form;
-}
-
 // ==================== Result Helpers ====================
 //
 // Results carry both a human-readable text block and the same payload as
@@ -609,20 +587,18 @@ function buildServer(workers: WorkersClient): McpServer {
     "list_workers",
     {
       title: "List Workers",
-      description: "List all Worker scripts in your account. Returns each Worker's name, timestamps, and whether it serves static assets.",
+      description:
+        "List all Workers in your account: name, created/modified/last-deployed timestamps, and whether workers.dev serving and observability are on.",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async () => {
-      const response = await workers.listWorkers();
-      // Some Cloudflare v4 list endpoints return null (not []) for empty
-      // collections, and the client itself yields result:null for empty bodies.
-      const scripts = (response.result ?? []).map(summarizeWorker);
+      const list = (await workers.listWorkers()).map(summarizeWorker);
       return ok(
         {
-          workers: scripts,
+          workers: list,
           account_id: workers.getAccountId(),
         },
-        `Found ${scripts.length} Worker(s)`
+        `Found ${list.length} Worker(s)`
       );
     }
   );
@@ -632,48 +608,37 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Get Worker",
       description:
-        "Get a Worker's settings (bindings, compatibility date and flags, placement, observability) plus its cron triggers and workers.dev subdomain status.",
+        "Get a Worker's settings (bindings, compatibility date and flags, placement, observability, logpush) for its live version, plus its cron triggers and workers.dev subdomain status.",
       inputSchema: GetWorkerSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      // Settings are the core payload; cron triggers and subdomain status are
-      // folded in best-effort — a failure there (e.g. a token scoped to
-      // scripts only) degrades to a note instead of failing the whole tool.
-      const [settings, schedules, subdomain, accountSubdomain] = await Promise.allSettled([
-        workers.getWorkerSettings(input.script_name),
-        workers.getCronTriggers(input.script_name),
-        workers.getScriptSubdomain(input.script_name),
-        workers.getAccountSubdomain(),
-      ]);
+      const existing = await getExisting(input.script_name);
+      if (!existing) throw notFound(input.script_name);
 
-      if (settings.status === "rejected") {
-        throw settings.reason;
+      // Cron triggers are folded in best-effort: a failure there (e.g. a token
+      // scoped to scripts only) degrades to undefined instead of failing.
+      let cron: string[] | undefined;
+      try {
+        cron = ((await workers.getCronTriggers(input.script_name)).result?.schedules ?? []).map(
+          (s) => s.cron
+        );
+      } catch {
+        cron = undefined;
       }
 
-      const cron =
-        schedules.status === "fulfilled"
-          ? (schedules.value.result?.schedules ?? []).map((s) => s.cron)
-          : undefined;
-
-      let workersDev: { enabled?: boolean; previews_enabled?: boolean; url?: string } | undefined;
-      if (subdomain.status === "fulfilled") {
-        const sub = subdomain.value.result ?? {};
-        workersDev = { enabled: sub.enabled, previews_enabled: sub.previews_enabled };
-        const accountSub =
-          accountSubdomain.status === "fulfilled"
-            ? accountSubdomain.value.result?.subdomain
-            : undefined;
-        if (sub.enabled && accountSub) {
-          workersDev.url = `https://${input.script_name}.${accountSub}.workers.dev`;
-        }
-      }
-
+      const sub = existing.worker.subdomain;
       return ok({
         script_name: input.script_name,
-        settings: settings.value.result,
+        settings: settingsView(existing),
         cron_triggers: cron,
-        workers_dev: workersDev,
+        workers_dev: sub
+          ? {
+              enabled: sub.enabled,
+              previews_enabled: sub.previews_enabled,
+              ...(sub.enabled && sub.url && { url: sub.url }),
+            }
+          : undefined,
       });
     }
   );
@@ -683,106 +648,249 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Get Worker Code",
       description:
-        "Download a Worker's deployed source code. Module-syntax Workers return one entry per module; service-worker-syntax Workers return a single script.",
+        "Download the source code of a Worker's live version: one entry per module. Service-worker-syntax Workers return a single script; assets-only Workers have no code.",
       inputSchema: GetWorkerCodeSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const { contentType, modules } = await workers.downloadWorkerCode(input.script_name);
+      const existing = await getExisting(input.script_name);
+      if (!existing) throw notFound(input.script_name);
+      if (!existing.liveVersionId) {
+        throw new Error(`${input.script_name} has no deployed version, so there is no live code to download.`);
+      }
+
+      const version = (await workers.getVersion(input.script_name, existing.liveVersionId, true)).result;
+      let modules: WorkerModule[] = (version.modules ?? []).map((m) => ({
+        name: m.name,
+        content_type: m.content_type,
+        content: Buffer.from(m.content_base64, "base64").toString("utf8"),
+      }));
+      let note: string | undefined;
+
+      if (modules.length === 0) {
+        // Service-worker-syntax versions carry no modules on the Workers API;
+        // the legacy content endpoint still serves them.
+        try {
+          modules = (await workers.downloadLegacyScript(input.script_name)).modules.filter(
+            (m) => m.content.length > 0
+          );
+          if (modules.length > 0) note = "Service-worker-syntax Worker (single script).";
+        } catch {
+          modules = [];
+        }
+        if (modules.length === 0) {
+          note = version.assets ? "Assets-only Worker: it serves static files and has no code." : "No code found for the live version.";
+        }
+      }
+
       return ok(
         {
           script_name: input.script_name,
-          content_type: contentType || undefined,
+          version_id: existing.liveVersionId,
           modules: modules.map((m) => ({
             name: m.name,
             content_type: m.content_type,
             size: Buffer.byteLength(m.content, "utf8"),
             content: m.content,
           })),
+          note,
         },
         `Fetched ${modules.length} module(s)`
       );
     }
   );
 
-  // ========== Static Site Tools ==========
+
+  // ========== Shared deploy helpers (Workers API) ==========
+
+  interface ExistingWorker {
+    worker: WorkerInfo;
+    /** The version serving traffic (the larger share during a gradual rollout). */
+    liveVersionId?: string;
+    /** True when traffic is split across two versions. */
+    gradual: boolean;
+    liveVersion?: WorkerVersion;
+  }
+
+  function notFound(scriptName: string): CloudflareAPIError {
+    return new CloudflareAPIError(
+      [{ code: 10007, message: `Worker '${scriptName}' not found on this account.` }],
+      404
+    );
+  }
 
   /**
-   * The Worker's current settings, or null when it doesn't exist yet. Used to
-   * preserve an existing Worker's pinned compatibility_date and to decide
-   * whether a deploy should touch workers.dev at all. Only a definitive 404
-   * means "new" — a transient probe failure aborts the deploy rather than
-   * risk treating an existing Worker as new (which would re-enable
-   * workers.dev and bump its compatibility date).
+   * The Worker and its live version, or null when the Worker doesn't exist.
+   * Only a definitive 404 means "new": any other failure aborts, so an
+   * existing Worker is never mistaken for a new one (which would re-enable
+   * workers.dev and reset its compatibility date).
    */
-  async function getExistingSettings(
-    scriptName: string
-  ): Promise<{ compatibility_date?: string } | null> {
+  async function getExisting(scriptName: string): Promise<ExistingWorker | null> {
+    let worker: WorkerInfo;
     try {
-      return (await workers.getWorkerSettings(scriptName)).result ?? {};
+      worker = (await workers.getWorker(scriptName)).result;
     } catch (error) {
-      if (error instanceof CloudflareAPIError && error.statusCode === 404) {
-        return null;
-      }
+      if (error instanceof CloudflareAPIError && error.statusCode === 404) return null;
       throw error;
     }
-  }
 
-  /**
-   * Best-effort workers.dev enablement after a deploy. Returns the public URL
-   * when everything succeeds, otherwise a note explaining what to do manually.
-   */
-  async function enableWorkersDev(
-    scriptName: string
-  ): Promise<{ url?: string; note?: string }> {
+    let current: Array<{ version_id: string; percentage: number }> = [];
     try {
-      await workers.setScriptSubdomain(scriptName, true);
-      const account = await workers.getAccountSubdomain();
-      const sub = account.result?.subdomain;
-      return sub
-        ? { url: `https://${scriptName}.${sub}.workers.dev` }
-        : { note: "workers.dev enabled, but the account has no workers.dev subdomain registered yet." };
+      current = (await workers.listDeployments(scriptName)).result?.deployments?.[0]?.versions ?? [];
     } catch (error) {
-      return {
-        note: `Deployed, but enabling workers.dev failed: ${error instanceof Error ? error.message : String(error)}. Enable it with set_workers_dev or attach a custom domain.`,
-      };
+      // A created-but-never-deployed Worker has no deployments.
+      if (!(error instanceof CloudflareAPIError && error.statusCode === 404)) throw error;
     }
+    const live = [...current].sort((a, b) => b.percentage - a.percentage)[0];
+    const liveVersion = live
+      ? (await workers.getVersion(scriptName, live.version_id)).result
+      : undefined;
+    return { worker, liveVersionId: live?.version_id, gradual: current.length > 1, liveVersion };
   }
 
   /**
-   * Report an existing Worker's workers.dev URL without changing its
-   * configuration (used when a redeploy leaves the subdomain setting alone).
+   * Merge-patching `latest` inherits from the most recently CREATED version,
+   * which is only safe when that version is the one serving all traffic. A
+   * staged version (create_version) or a gradual rollout would otherwise
+   * silently become the base of what gets deployed.
    */
-  async function workersDevStatus(scriptName: string): Promise<{ url?: string; note?: string }> {
-    try {
-      const [sub, account] = await Promise.all([
-        workers.getScriptSubdomain(scriptName),
-        workers.getAccountSubdomain(),
-      ]);
-      if (sub.result?.enabled && account.result?.subdomain) {
-        return { url: `https://${scriptName}.${account.result.subdomain}.workers.dev` };
-      }
-      return { note: "workers.dev serving is disabled for this Worker (unchanged by this deploy)." };
-    } catch {
-      return {};
-    }
-  }
-
-  /**
-   * The tri-state workers.dev decision after a deploy: an explicit true
-   * enables, explicit false leaves everything alone, and omitted enables only
-   * newly created Workers — a redeploy never re-exposes a Worker whose
-   * workers.dev serving was deliberately disabled.
-   */
-  async function applyWorkersDev(
+  async function assertLatestIsLive(
     scriptName: string,
+    existing: ExistingWorker,
+    action: string
+  ): Promise<void> {
+    if (!existing.liveVersionId) {
+      throw new Error(`${scriptName} has no deployed version to ${action} from. Deploy it first.`);
+    }
+    if (existing.gradual) {
+      throw new Error(
+        `${scriptName} is in a gradual rollout (traffic split across two versions). Finish or roll back the rollout with create_deployment before you ${action}.`
+      );
+    }
+    const latest = (await workers.getLatestVersion(scriptName)).result;
+    if (latest?.id !== existing.liveVersionId) {
+      throw new Error(
+        `The newest version of ${scriptName} (${latest?.id}) is staged, not live (live: ${existing.liveVersionId}), so it can't be used as the base to ${action}. Deploy or discard the staged version with create_deployment first, or do a full upload (deploy_static_site, or deploy_worker without keep_assets).`
+      );
+    }
+  }
+
+  /**
+   * Carry the live version's secrets into a new version unless the caller set
+   * them explicitly. Legacy script uploads kept secrets implicitly; Workers API
+   * versions drop every binding that isn't listed (verified live 2026-11-05).
+   */
+  function withInheritedSecrets(
+    explicit: Array<{ name: string }>,
+    existing: ExistingWorker | null
+  ): { bindings: Array<Record<string, unknown>>; inherited: string[] } {
+    const named = new Set(explicit.map((b) => b.name));
+    const inherited = (existing?.liveVersion?.bindings ?? [])
+      .filter(
+        (b) =>
+          (b.type === "secret_text" || b.type === "secret_key") &&
+          typeof b.name === "string" &&
+          !named.has(b.name)
+      )
+      .map((b) => b.name as string);
+    return {
+      bindings: [
+        ...(explicit as Array<Record<string, unknown>>),
+        ...inherited.map((name) => ({ type: "inherit", name, version_id: existing!.liveVersionId! })),
+      ],
+      inherited,
+    };
+  }
+
+  function toVersionModules(
+    modules: Array<{ name: string; content: string; content_type?: string }>
+  ): VersionModule[] {
+    return modules.map((mod) => ({
+      name: mod.name,
+      content_type: mod.content_type ?? "application/javascript+module",
+      content_base64: Buffer.from(mod.content, "utf8").toString("base64"),
+    }));
+  }
+
+  /**
+   * Annotations for versions created by merge-patching `latest`: set an
+   * explicit message and clear any inherited tag, so the new version doesn't
+   * masquerade as the previous one in list_versions.
+   */
+  function patchAnnotations(message: string, tag?: string): VersionBody["annotations"] {
+    return { "workers/message": message, "workers/tag": tag ?? null };
+  }
+
+  /** A new Worker is created with workers.dev on unless explicitly disabled. */
+  async function createWorkerFor(
+    scriptName: string,
+    requestedWorkersDev: boolean | undefined,
+    extra: WorkerPatch = {}
+  ): Promise<WorkerInfo> {
+    return (
+      await workers.createWorker(scriptName, {
+        subdomain: { enabled: requestedWorkersDev !== false },
+        ...extra,
+      })
+    ).result;
+  }
+
+  /**
+   * workers.dev after a deploy: an explicit true enables it on an existing
+   * Worker; otherwise an existing Worker's setting is left alone and only
+   * reported. Returns the URL when served, or a note explaining why not.
+   */
+  async function workersDevAfterDeploy(
+    scriptName: string,
+    worker: WorkerInfo,
     requested: boolean | undefined,
     isNew: boolean
   ): Promise<{ url?: string; note?: string }> {
+    let sub = worker.subdomain;
+    if (!isNew && requested === true && !sub?.enabled) {
+      try {
+        sub = (
+          await workers.patchWorker(scriptName, {
+            subdomain: { enabled: true, previews_enabled: sub?.previews_enabled ?? false },
+          })
+        ).result?.subdomain;
+      } catch (error) {
+        return {
+          note: `Deployed, but enabling workers.dev failed: ${error instanceof Error ? error.message : String(error)}. Enable it with set_workers_dev or attach a custom domain.`,
+        };
+      }
+    }
+    if (sub?.enabled) {
+      return sub.url
+        ? { url: sub.url }
+        : { note: "workers.dev is enabled, but the account has no workers.dev subdomain registered yet." };
+    }
     if (requested === false) return {};
-    if (requested === true || isNew) return enableWorkersDev(scriptName);
-    return workersDevStatus(scriptName);
+    return { note: "workers.dev serving is disabled for this Worker (unchanged by this deploy)." };
   }
+
+  /** Settings view of a Worker: Worker-level fields plus its live version's. */
+  function settingsView(existing: ExistingWorker) {
+    const version = existing.liveVersion;
+    return {
+      live_version_id: existing.liveVersionId,
+      ...(existing.gradual && { gradual_rollout: true }),
+      main_module: version?.main_module,
+      bindings: version?.bindings,
+      compatibility_date: version?.compatibility_date,
+      compatibility_flags: version?.compatibility_flags,
+      assets_config: version?.assets?.config,
+      placement: version?.placement,
+      limits: version?.limits,
+      usage_model: version?.usage_model,
+      logpush: existing.worker.logpush,
+      observability: existing.worker.observability,
+      tail_consumers: existing.worker.tail_consumers,
+      tags: existing.worker.tags,
+    };
+  }
+
+  // ========== Static Site Tools ==========
 
   addTool(
     "deploy_static_site",
@@ -794,8 +902,10 @@ function buildServer(workers: WorkersClient): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      const existing = await getExistingSettings(input.script_name);
+      const existing = await getExisting(input.script_name);
+      // Walk the directory first so local problems fail before anything is created.
       const collected = await collectAssets(input.directory);
+      const worker = existing?.worker ?? (await createWorkerFor(input.script_name, input.enable_workers_dev));
       const upload = await uploadAssets(workers, input.script_name, collected.files);
 
       const config: AssetsConfig = {
@@ -805,19 +915,19 @@ function buildServer(workers: WorkersClient): McpServer {
         ...(collected.headers !== undefined && { _headers: collected.headers }),
         ...(collected.redirects !== undefined && { _redirects: collected.redirects }),
       };
-      const metadata: ScriptUploadMetadata = {
+      const body: VersionBody = {
+        compatibility_date:
+          input.compatibility_date ?? existing?.liveVersion?.compatibility_date ?? todayISO(),
         assets: {
           jwt: upload.completionJwt,
           ...(Object.keys(config).length > 0 && { config }),
         },
-        compatibility_date:
-          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
       };
+      const version = (await workers.createVersion(input.script_name, body, true)).result;
 
-      await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
-
-      const workersDev = await applyWorkersDev(
+      const workersDev = await workersDevAfterDeploy(
         input.script_name,
+        worker,
         input.enable_workers_dev,
         existing === null
       );
@@ -825,6 +935,7 @@ function buildServer(workers: WorkersClient): McpServer {
       return ok(
         {
           script_name: input.script_name,
+          version_id: version?.id,
           files_total: collected.files.length,
           files_uploaded: upload.uploaded,
           files_reused: upload.skipped,
@@ -847,25 +958,34 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Redeploy Assets",
       description:
-        "Create a new deployment of an assets-only Worker that reuses its previously uploaded files and asset config (keep_assets) — e.g. to bump compatibility_date. It cannot change html_handling/not_found_handling/base_path: Cloudflare ignores asset config without a fresh upload, so use deploy_static_site for that (unchanged files dedupe, so nothing is re-uploaded).",
+        "Create and deploy a new version of an assets-only Worker that reuses its live version's files and asset config, e.g. to bump compatibility_date. It cannot change html_handling/not_found_handling/base_path; use deploy_static_site for that (unchanged files dedupe, so nothing is re-uploaded). Refuses while a staged version or a gradual rollout is pending.",
       inputSchema: RedeployAssetsSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      const existing = await getExistingSettings(input.script_name);
-      const metadata: ScriptUploadMetadata = {
-        keep_assets: true,
-        compatibility_date:
-          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
-      };
+      const existing = await getExisting(input.script_name);
+      if (!existing) throw notFound(input.script_name);
+      await assertLatestIsLive(input.script_name, existing, "redeploy");
 
-      await workers.uploadScript(input.script_name, scriptUploadForm(metadata));
+      const compatibilityDate =
+        input.compatibility_date ?? existing.liveVersion?.compatibility_date ?? todayISO();
+      const version = (
+        await workers.patchLatestVersion(
+          input.script_name,
+          {
+            compatibility_date: compatibilityDate,
+            annotations: patchAnnotations(`Redeploy reusing assets (compatibility_date ${compatibilityDate})`),
+          },
+          true
+        )
+      ).result;
 
       return ok(
         {
           script_name: input.script_name,
+          version_id: version?.id,
           assets_reused: true,
-          compatibility_date: metadata.compatibility_date,
+          compatibility_date: compatibilityDate,
         },
         `Redeployed ${input.script_name} reusing existing assets and asset config`
       );
@@ -879,7 +999,7 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Deploy Worker",
       description:
-        "Upload and deploy a Worker script (ES modules) with optional bindings (plain_text, secret_text, kv_namespace, r2_bucket, d1, assets). Replaces the Worker's code and binding set if it already exists. Set keep_assets to retain a site's static assets while updating code. By default the Worker is served on workers.dev.",
+        "Upload and deploy a Worker script (ES modules) with optional bindings (plain_text, secret_text, kv_namespace, r2_bucket, d1, assets). Replaces the Worker's code and binding set if it already exists; existing secrets are kept unless you pass a binding with the same name. Set keep_assets to retain a site's static assets while updating code. By default a new Worker is served on workers.dev.",
       inputSchema: DeployWorkerSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
@@ -891,26 +1011,43 @@ function buildServer(workers: WorkersClient): McpServer {
         );
       }
 
-      const existing = await getExistingSettings(input.script_name);
-      const metadata: ScriptUploadMetadata = {
+      const existing = await getExisting(input.script_name);
+      if (input.keep_assets && !existing) {
+        throw new Error(`keep_assets keeps an existing Worker's assets, but ${input.script_name} doesn't exist yet.`);
+      }
+      const { bindings, inherited } = withInheritedSecrets(input.bindings ?? [], existing);
+      const code: VersionBody = {
         main_module: mainModule,
-        ...(input.bindings && { bindings: input.bindings }),
+        modules: toVersionModules(input.modules),
+        bindings,
         compatibility_date:
-          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
-        ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
-        ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
-        ...(input.enable_observability !== undefined && {
-          observability: { enabled: input.enable_observability },
-        }),
+          input.compatibility_date ?? existing?.liveVersion?.compatibility_date ?? todayISO(),
+        compatibility_flags: input.compatibility_flags ?? [],
       };
+      const observability =
+        input.enable_observability !== undefined ? { observability: { enabled: input.enable_observability } } : {};
 
-      const response = await workers.uploadScript(
-        input.script_name,
-        scriptUploadForm(metadata, input.modules)
-      );
+      const worker = existing?.worker ?? (await createWorkerFor(input.script_name, input.enable_workers_dev, observability));
+      let version: WorkerVersion;
+      if (input.keep_assets) {
+        await assertLatestIsLive(input.script_name, existing!, "keep its assets");
+        version = (
+          await workers.patchLatestVersion(
+            input.script_name,
+            { ...code, annotations: patchAnnotations("Deploy code, keeping assets") },
+            true
+          )
+        ).result;
+      } else {
+        version = (await workers.createVersion(input.script_name, code, true)).result;
+      }
+      if (existing && input.enable_observability !== undefined) {
+        await workers.patchWorker(input.script_name, observability);
+      }
 
-      const workersDev = await applyWorkersDev(
+      const workersDev = await workersDevAfterDeploy(
         input.script_name,
+        worker,
         input.enable_workers_dev,
         existing === null
       );
@@ -918,11 +1055,12 @@ function buildServer(workers: WorkersClient): McpServer {
       return ok(
         {
           script_name: input.script_name,
+          version_id: version?.id,
           main_module: mainModule,
           modules: input.modules.map((m) => m.name),
           bindings: (input.bindings ?? []).map((b) => ({ type: b.type, name: b.name })),
-          compatibility_date: metadata.compatibility_date,
-          etag: response.result?.etag,
+          ...(inherited.length > 0 && { secrets_kept: inherited }),
+          compatibility_date: code.compatibility_date,
           url: workersDev.url,
           note: workersDev.note,
         },
@@ -930,6 +1068,7 @@ function buildServer(workers: WorkersClient): McpServer {
       );
     }
   );
+
 
   addTool(
     "delete_worker",
@@ -954,24 +1093,75 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Update Worker Settings",
       description:
-        "Update a Worker's settings (bindings, compatibility date/flags, logpush, observability) without re-uploading its code. Note: bindings REPLACE the Worker's full binding set.",
+        "Update a Worker's settings (bindings, compatibility date/flags, logpush, observability) without re-uploading its code. Bindings REPLACE the Worker's full binding set, except that existing secrets are kept unless listed. Binding and compatibility changes deploy a new version; refuses while a staged version or a gradual rollout is pending.",
       inputSchema: UpdateWorkerSettingsSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const { script_name, ...fields } = input;
-      const settings = Object.fromEntries(
-        Object.entries(fields).filter(([, value]) => value !== undefined)
-      );
-      if (Object.keys(settings).length === 0) {
+      const { script_name, bindings, compatibility_date, compatibility_flags, logpush, observability } = input;
+      if (
+        bindings === undefined &&
+        compatibility_date === undefined &&
+        compatibility_flags === undefined &&
+        logpush === undefined &&
+        observability === undefined
+      ) {
         throw new Error(
           "No updatable fields provided. Specify at least one of: bindings, compatibility_date, compatibility_flags, logpush, observability."
         );
       }
 
-      const response = await workers.patchWorkerSettings(script_name, settings);
+      const existing = await getExisting(script_name);
+      if (!existing) throw notFound(script_name);
+
+      // Version-level fields: a new version from the live one (merge patch).
+      const changed = [
+        ...(bindings ? ["bindings"] : []),
+        ...(compatibility_date ? ["compatibility_date"] : []),
+        ...(compatibility_flags ? ["compatibility_flags"] : []),
+      ];
+      let version: WorkerVersion | undefined;
+      let kept: string[] = [];
+      if (changed.length > 0) {
+        await assertLatestIsLive(script_name, existing, "update its settings");
+        const withSecrets = bindings ? withInheritedSecrets(bindings, existing) : undefined;
+        kept = withSecrets?.inherited ?? [];
+        version = (
+          await workers.patchLatestVersion(
+            script_name,
+            {
+              ...(withSecrets && { bindings: withSecrets.bindings }),
+              ...(compatibility_date && { compatibility_date }),
+              ...(compatibility_flags && { compatibility_flags }),
+              annotations: patchAnnotations(`Update settings: ${changed.join(", ")}`),
+            },
+            true
+          )
+        ).result;
+      }
+
+      // Worker-level fields.
+      let worker = existing.worker;
+      if (logpush !== undefined || observability !== undefined) {
+        worker = (
+          await workers.patchWorker(script_name, {
+            ...(logpush !== undefined && { logpush }),
+            ...(observability && { observability }),
+          })
+        ).result;
+      }
+
       return ok(
-        { script_name, settings: response.result },
+        {
+          script_name,
+          ...(version && { version_id: version.id }),
+          ...(kept.length > 0 && { secrets_kept: kept }),
+          settings: settingsView({
+            ...existing,
+            worker,
+            ...(version && { liveVersion: version, liveVersionId: version.id }),
+          }),
+        },
         `Updated settings for '${script_name}'`
       );
     }
@@ -984,23 +1174,19 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "List Versions",
       description:
-        "List a Worker's versions (newest first): version ID, number, author, source, and deploy message. Versions are immutable snapshots; use list_deployments to see which are live.",
+        "List a Worker's 100 most recent versions (newest first): version ID, number, author, source, and deploy message/tag. Versions are immutable snapshots; use list_deployments to see which are live.",
       inputSchema: ListVersionsSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const response = await workers.listVersions(input.script_name);
-      // The documented shape is { items: [...] }; tolerate a bare array too.
-      const items: WorkerVersion[] = Array.isArray(response.result)
-        ? response.result
-        : (response.result?.items ?? []);
-      const versions = items.map(summarizeVersion);
+      const versions = ((await workers.listVersions(input.script_name)).result ?? []).map(summarizeVersion);
       return ok(
         { script_name: input.script_name, versions },
         `Found ${versions.length} version(s)`
       );
     }
   );
+
 
   addTool(
     "list_deployments",
@@ -1026,17 +1212,27 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Get Version",
       description:
-        "Get a Worker version's detail: bindings, compatibility date/flags, handlers, and usage model for that immutable snapshot.",
+        "Get a Worker version's detail: main module, bindings, compatibility date/flags, asset config, placement and limits for that immutable snapshot.",
       inputSchema: GetVersionSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const response = await workers.getVersion(input.script_name, input.version_id);
-      const version = response.result;
+      const version = (await workers.getVersion(input.script_name, input.version_id)).result;
       return ok({
         script_name: input.script_name,
         version: summarizeVersion(version),
-        resources: version.resources,
+        detail: {
+          main_module: version.main_module,
+          compatibility_date: version.compatibility_date,
+          compatibility_flags: version.compatibility_flags,
+          bindings: version.bindings,
+          assets_config: version.assets?.config,
+          placement: version.placement,
+          limits: version.limits,
+          usage_model: version.usage_model,
+          startup_time_ms: version.startup_time_ms,
+          urls: version.urls,
+        },
       });
     }
   );
@@ -1046,7 +1242,7 @@ function buildServer(workers: WorkersClient): McpServer {
     {
       title: "Create Version (staged)",
       description:
-        "Upload a new Worker version WITHOUT deploying it — live traffic is unchanged until the version is referenced by create_deployment. Use for staged rollouts.",
+        "Upload a new Worker version WITHOUT deploying it — live traffic is unchanged until the version is referenced by create_deployment. Use for staged rollouts. Existing secrets carry over unless you pass a binding with the same name.",
       inputSchema: CreateVersionSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -1058,36 +1254,57 @@ function buildServer(workers: WorkersClient): McpServer {
         );
       }
 
-      const existing = await getExistingSettings(input.script_name);
-      const annotations: { "workers/message"?: string; "workers/tag"?: string } = {
-        ...(input.message && { "workers/message": input.message }),
-        ...(input.tag && { "workers/tag": input.tag }),
-      };
-      const metadata: ScriptUploadMetadata = {
+      const existing = await getExisting(input.script_name);
+      if (!existing) {
+        throw new Error(
+          `create_version stages a new version of an existing Worker, but ${input.script_name} doesn't exist. Deploy it first with deploy_worker.`
+        );
+      }
+      const { bindings } = withInheritedSecrets(input.bindings ?? [], existing);
+      const code: VersionBody = {
         main_module: mainModule,
-        ...(input.bindings && { bindings: input.bindings }),
+        modules: toVersionModules(input.modules),
+        bindings,
         compatibility_date:
-          input.compatibility_date ?? existing?.compatibility_date ?? todayISO(),
-        ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
-        ...(input.keep_assets !== undefined && { keep_assets: input.keep_assets }),
-        ...(Object.keys(annotations).length > 0 && { annotations }),
+          input.compatibility_date ?? existing.liveVersion?.compatibility_date ?? todayISO(),
+        compatibility_flags: input.compatibility_flags ?? [],
       };
 
-      const response = await workers.createVersion(
-        input.script_name,
-        scriptUploadForm(metadata, input.modules)
-      );
+      let version: WorkerVersion;
+      if (input.keep_assets) {
+        await assertLatestIsLive(input.script_name, existing, "keep its assets");
+        version = (
+          await workers.patchLatestVersion(
+            input.script_name,
+            { ...code, annotations: patchAnnotations(input.message ?? "Staged code, keeping assets", input.tag) },
+            false
+          )
+        ).result;
+      } else {
+        const annotations = {
+          ...(input.message && { "workers/message": input.message }),
+          ...(input.tag && { "workers/tag": input.tag }),
+        };
+        version = (
+          await workers.createVersion(
+            input.script_name,
+            { ...code, ...(Object.keys(annotations).length > 0 && { annotations }) },
+            false
+          )
+        ).result;
+      }
 
       return ok(
         {
           script_name: input.script_name,
-          version: summarizeVersion(response.result),
+          version: summarizeVersion(version),
           deployed: false,
         },
-        `Created staged version ${response.result?.number ?? ""} (${response.result?.id}) — deploy it with create_deployment`
+        `Created staged version ${version?.number ?? ""} (${version?.id}) — deploy it with create_deployment`
       );
     }
   );
+
 
   addTool(
     "create_deployment",
@@ -1239,28 +1456,22 @@ function buildServer(workers: WorkersClient): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const response = await workers.setScriptSubdomain(
-        input.script_name,
-        input.enabled,
-        input.previews_enabled
-      );
-
-      let url: string | undefined;
-      if (response.result?.enabled) {
-        try {
-          const account = await workers.getAccountSubdomain();
-          const sub = account.result?.subdomain;
-          if (sub) url = `https://${input.script_name}.${sub}.workers.dev`;
-        } catch {
-          // URL is a convenience; the setting itself succeeded.
-        }
-      }
+      const current = (await workers.getWorker(input.script_name)).result?.subdomain;
+      const sub = (
+        await workers.patchWorker(input.script_name, {
+          subdomain: {
+            enabled: input.enabled,
+            previews_enabled: input.previews_enabled ?? current?.previews_enabled ?? false,
+          },
+        })
+      ).result?.subdomain;
+      const url = sub?.enabled ? sub.url : undefined;
 
       return ok(
         {
           script_name: input.script_name,
-          enabled: response.result?.enabled,
-          previews_enabled: response.result?.previews_enabled,
+          enabled: sub?.enabled,
+          previews_enabled: sub?.previews_enabled,
           url,
         },
         input.enabled
@@ -1384,15 +1595,16 @@ function buildServer(workers: WorkersClient): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      const existing = await getExistingSettings(input.script_name);
+      const existing = await getExisting(input.script_name);
       if (existing === null) {
         throw new Error(
           `Worker ${input.script_name} doesn't exist. Previews attach to an existing Worker, so deploy production first (deploy_static_site or deploy_worker).`
         );
       }
 
-      const body: PreviewDeploymentBody = {
-        compatibility_date: input.compatibility_date ?? existing.compatibility_date ?? todayISO(),
+      const body: VersionBody = {
+        compatibility_date:
+          input.compatibility_date ?? existing.liveVersion?.compatibility_date ?? todayISO(),
         ...(input.compatibility_flags && { compatibility_flags: input.compatibility_flags }),
       };
       let files: { files_total: number; files_uploaded: number; files_reused: number } | undefined;
@@ -1415,19 +1627,17 @@ function buildServer(workers: WorkersClient): McpServer {
       } else {
         const modules = input.modules!;
         body.main_module = input.main_module ?? modules[0].name;
-        body.modules = modules.map((mod) => ({
-          name: mod.name,
-          content_type: mod.content_type ?? "application/javascript+module",
-          content_base64: Buffer.from(mod.content, "utf8").toString("base64"),
-        }));
+        body.modules = toVersionModules(modules);
         if (input.bindings) body.bindings = input.bindings;
       }
 
       let note: string | undefined;
       if (input.enable_preview_urls !== false) {
-        const sub = await workers.getScriptSubdomain(input.script_name);
-        if (!sub.result?.previews_enabled) {
-          await workers.setScriptSubdomain(input.script_name, sub.result?.enabled ?? false, true);
+        const sub = existing.worker.subdomain;
+        if (!sub?.previews_enabled) {
+          await workers.patchWorker(input.script_name, {
+            subdomain: { enabled: sub?.enabled ?? false, previews_enabled: true },
+          });
           note = "Enabled preview URLs for this Worker (production workers.dev setting unchanged).";
         }
       }

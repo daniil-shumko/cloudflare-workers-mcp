@@ -11,22 +11,21 @@ import type {
   AssetUploadSession,
   CloudflareResponse,
   CronTriggerList,
-  ScriptSubdomain,
+  PreviewDeployment,
+  PreviewDeploymentBody,
   TelemetryQueryRequest,
   TelemetryQueryResult,
+  VersionBody,
   WorkerDeployment,
   WorkerDeploymentList,
   WorkerDomain,
+  WorkerInfo,
   WorkerModule,
-  WorkerScript,
-  WorkerScriptSettings,
-  PreviewDeployment,
-  PreviewDeploymentBody,
+  WorkerPatch,
   WorkerPreview,
   WorkerSecret,
   WorkerTail,
   WorkerVersion,
-  WorkerVersionList,
 } from "./types.js";
 
 export class CloudflareAPIError extends Error {
@@ -198,40 +197,76 @@ export class WorkersClient {
     return trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed;
   }
 
-  // ==================== Worker Methods ====================
+  // ==================== Workers (Workers API, GA) ====================
+  //
+  // /accounts/{id}/workers/workers/{worker} accepts the Worker NAME as the id,
+  // so every tool keeps taking script names. These replace the legacy
+  // /workers/scripts endpoints that Cloudflare's schema now tags deprecated.
+  // Deployments, schedules, domains, secrets, tails and asset upload stay on
+  // their (GA) scripts paths.
 
-  /**
-   * List all Worker scripts in the account (legacy Scripts API).
-   */
-  async listWorkers(): Promise<CloudflareResponse<WorkerScript[]>> {
-    return this.request<WorkerScript[]>(
-      "GET",
-      `/accounts/${this.accountId}/workers/scripts`
+  private workerPath(scriptName: string): string {
+    return `/accounts/${this.accountId}/workers/workers/${encodeURIComponent(scriptName)}`;
+  }
+
+  /** All Workers in the account (walks every page; the API caps per_page at 100). */
+  async listWorkers(): Promise<WorkerInfo[]> {
+    const all: WorkerInfo[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const response = await this.request<WorkerInfo[]>(
+        "GET",
+        `/accounts/${this.accountId}/workers/workers`,
+        undefined,
+        { page, per_page: 100 }
+      );
+      const items = response.result ?? [];
+      all.push(...items);
+      const total = response.result_info?.total_count;
+      if (items.length < 100 || (total !== undefined && all.length >= total)) break;
+    }
+    return all;
+  }
+
+  async getWorker(scriptName: string): Promise<CloudflareResponse<WorkerInfo>> {
+    return this.request<WorkerInfo>("GET", this.workerPath(scriptName));
+  }
+
+  /** Create an (empty, undeployed) Worker; upload a version to give it code or assets. */
+  async createWorker(
+    scriptName: string,
+    settings: WorkerPatch = {}
+  ): Promise<CloudflareResponse<WorkerInfo>> {
+    return this.request<WorkerInfo>("POST", `/accounts/${this.accountId}/workers/workers`, {
+      name: scriptName,
+      ...settings,
+    });
+  }
+
+  /** Partial update of Worker-level settings (logpush, observability, subdomain). */
+  async patchWorker(scriptName: string, patch: WorkerPatch): Promise<CloudflareResponse<WorkerInfo>> {
+    return this.request<WorkerInfo>("PATCH", this.workerPath(scriptName), patch);
+  }
+
+  /** Delete a Worker with all versions, deployments and assets. `force` breaks dependencies. */
+  async deleteWorker(scriptName: string, force?: boolean): Promise<CloudflareResponse<null>> {
+    return this.request<null>(
+      "DELETE",
+      this.workerPath(scriptName),
+      undefined,
+      force ? { force: true } : undefined
     );
   }
 
   /**
-   * Get a Worker's settings (bindings, compatibility date/flags, placement,
-   * observability). This is the metadata view — fetching script *content* is
-   * a separate endpoint, added alongside the deploy tools.
-   */
-  async getWorkerSettings(
-    scriptName: string
-  ): Promise<CloudflareResponse<WorkerScriptSettings>> {
-    return this.request<WorkerScriptSettings>(
-      "GET",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`
-    );
-  }
-
-  /**
-   * Download a Worker's code (legacy `GET .../scripts/{name}`). Service-worker
+   * Download a Worker's code via the LEGACY `GET .../scripts/{name}` (deprecated
+   * endpoint). Only used as a fallback for service-worker-syntax Workers, whose
+   * versions carry no `modules` on the Workers API (verified live 2026-11-05). Service-worker
    * scripts come back as a single body; module-syntax scripts come back as
    * multipart/form-data with one part per module — normalized here to a
    * uniform module list. This bypasses `request()` because the response is
    * raw script content, not the JSON envelope (errors still use the envelope).
    */
-  async downloadWorkerCode(
+  async downloadLegacyScript(
     scriptName: string
   ): Promise<{ contentType: string; modules: WorkerModule[] }> {
     await this.rateLimiter.acquire();
@@ -297,7 +332,7 @@ export class WorkersClient {
     }
   }
 
-  // ==================== Uploads & Lifecycle ====================
+  // ==================== Asset uploads (GA scripts path) ====================
 
   /**
    * Start an asset upload session for a script: send the manifest, get back a
@@ -334,109 +369,75 @@ export class WorkersClient {
     );
   }
 
-  /**
-   * Upload (deploy) a script: multipart form with a `metadata` JSON part plus
-   * zero or more module parts. Callers build the FormData (see assets.ts and
-   * the deploy tools); an assets-only Worker sends metadata with no modules.
-   */
-  async uploadScript(
-    scriptName: string,
-    form: FormData
-  ): Promise<CloudflareResponse<WorkerScript>> {
-    return this.request<WorkerScript>(
-      "PUT",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
-      form,
-      undefined,
-      { timeoutMs: 120000 }
-    );
-  }
+  // ==================== Versions (Workers API, GA) ====================
 
-  /**
-   * Partial settings update (bindings, compat date/flags, observability, …)
-   * without re-uploading code. The body is multipart/form-data with a single
-   * `settings` JSON part — NOT a plain JSON body.
-   */
-  async patchWorkerSettings(
-    scriptName: string,
-    settings: Record<string, unknown>
-  ): Promise<CloudflareResponse<WorkerScriptSettings>> {
-    const form = new FormData();
-    form.append(
-      "settings",
-      new File([JSON.stringify(settings)], "settings.json", { type: "application/json" })
-    );
-    return this.request<WorkerScriptSettings>(
-      "PATCH",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`,
-      form
-    );
-  }
-
-  /** Delete a Worker script. `force` breaks dependencies (e.g. routes). */
-  async deleteWorker(
-    scriptName: string,
-    force?: boolean
-  ): Promise<CloudflareResponse<null>> {
-    return this.request<null>(
-      "DELETE",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
-      undefined,
-      force ? { force: true } : undefined
-    );
-  }
-
-  /** Enable/disable serving a script on workers.dev. */
-  async setScriptSubdomain(
-    scriptName: string,
-    enabled: boolean,
-    previewsEnabled?: boolean
-  ): Promise<CloudflareResponse<ScriptSubdomain>> {
-    return this.request<ScriptSubdomain>(
-      "POST",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`,
-      previewsEnabled === undefined ? { enabled } : { enabled, previews_enabled: previewsEnabled }
-    );
-  }
-
-  // ==================== Versions & Deployments ====================
-
-  async listVersions(
-    scriptName: string
-  ): Promise<CloudflareResponse<WorkerVersionList | WorkerVersion[]>> {
-    return this.request<WorkerVersionList | WorkerVersion[]>(
+  /** The most recent versions, newest first (single page of up to `perPage`, max 100). */
+  async listVersions(scriptName: string, perPage = 100): Promise<CloudflareResponse<WorkerVersion[]>> {
+    return this.request<WorkerVersion[]>(
       "GET",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`
+      `${this.workerPath(scriptName)}/versions`,
+      undefined,
+      { per_page: perPage }
     );
   }
 
+  /** One version; `includeModules` adds the base64 code (can be megabytes). */
   async getVersion(
     scriptName: string,
-    versionId: string
+    versionId: string,
+    includeModules = false
   ): Promise<CloudflareResponse<WorkerVersion>> {
     return this.request<WorkerVersion>(
       "GET",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions/${encodeURIComponent(versionId)}`
+      `${this.workerPath(scriptName)}/versions/${encodeURIComponent(versionId)}`,
+      undefined,
+      includeModules ? { include: "modules" } : undefined
     );
   }
 
   /**
-   * Upload a version WITHOUT deploying it (staged). Same multipart shape as a
-   * script upload, but version metadata accepts a narrower field set (no
-   * migrations/logpush/tail_consumers).
+   * Create a version from a complete body. `deploy: true` also deploys it to
+   * 100% of traffic in the same call; otherwise it is staged.
    */
   async createVersion(
     scriptName: string,
-    form: FormData
+    body: VersionBody,
+    deploy: boolean
   ): Promise<CloudflareResponse<WorkerVersion>> {
     return this.request<WorkerVersion>(
       "POST",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`,
-      form,
-      undefined,
+      `${this.workerPath(scriptName)}/versions`,
+      body,
+      deploy ? { deploy: true } : undefined,
       { timeoutMs: 120000 }
     );
   }
+
+  /**
+   * Create a version by merge-patching the LATEST version: omitted fields
+   * (including assets) are inherited. "Latest" means most recently CREATED,
+   * which may be a staged version — callers must check it is the live one.
+   */
+  async patchLatestVersion(
+    scriptName: string,
+    patch: Partial<VersionBody>,
+    deploy: boolean
+  ): Promise<CloudflareResponse<WorkerVersion>> {
+    return this.request<WorkerVersion>(
+      "PATCH",
+      `${this.workerPath(scriptName)}/versions/latest`,
+      patch,
+      deploy ? { deploy: true } : undefined,
+      { timeoutMs: 120000 }
+    );
+  }
+
+  /** Metadata of the most recently created version (no modules). */
+  async getLatestVersion(scriptName: string): Promise<CloudflareResponse<WorkerVersion>> {
+    return this.request<WorkerVersion>("GET", `${this.workerPath(scriptName)}/versions/latest`);
+  }
+
+  // ==================== Deployments (GA scripts path) ====================
 
   async listDeployments(
     scriptName: string
@@ -534,15 +535,6 @@ export class WorkersClient {
     );
   }
 
-  async getScriptSubdomain(
-    scriptName: string
-  ): Promise<CloudflareResponse<ScriptSubdomain>> {
-    return this.request<ScriptSubdomain>(
-      "GET",
-      `/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`
-    );
-  }
-
   async getAccountSubdomain(): Promise<CloudflareResponse<AccountSubdomain>> {
     return this.request<AccountSubdomain>(
       "GET",
@@ -602,10 +594,6 @@ export class WorkersClient {
   // NAME as the id, so callers keep using script names. Verified live
   // 2026-11-05: preview deployments never touch production; preview URLs are
   // only routable once the Worker's subdomain has previews_enabled.
-
-  private workerPath(scriptName: string): string {
-    return `/accounts/${this.accountId}/workers/workers/${encodeURIComponent(scriptName)}`;
-  }
 
   async listPreviews(
     scriptName: string,
