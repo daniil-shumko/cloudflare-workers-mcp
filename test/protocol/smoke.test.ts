@@ -157,6 +157,20 @@ for (const { era, options } of ERAS) {
         "deploy_preview rejects both directory and modules"
       );
 
+      // ---- issue #1: module sources are content XOR path, unknown keys fail ----
+      await rejects(
+        "deploy_worker",
+        { script_name: "x", modules: [{ name: "a.js", content: "", file: "/abs/worker.js" }] },
+        "an unknown module key fails instead of being stripped"
+      );
+      await rejects(
+        "deploy_worker",
+        { script_name: "x", modules: [{ name: "a.js", content: "x", path: "/abs/worker.js" }] },
+        "content and path are mutually exclusive"
+      );
+      await rejects("deploy_worker", { script_name: "x", modules: [{ name: "a.js" }] }, "a module needs content or path");
+      await rejects("create_version", { script_name: "x", modules: [{ content: "x" }] }, "inline content needs a name");
+
       // ---- newer optional inputs are advertised ----
       const propsOf = (name: string) =>
         Object.keys((tools.find((t) => t.name === name)?.inputSchema?.properties ?? {}) as Record<string, unknown>);

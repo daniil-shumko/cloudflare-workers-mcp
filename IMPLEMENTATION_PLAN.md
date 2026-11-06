@@ -246,6 +246,7 @@ src/
 ├── workers/
 │   ├── client.ts        # WorkersClient (Bearer auth, rate-limited, CloudflareAPIError)
 │   ├── assets.ts        # (M2) manifest hashing + upload-session/bucket flow
+│   ├── modules.ts       # module sources: inline content XOR local path (issue #1)
 │   ├── summarize.ts     # pure response summarizers
 │   └── types.ts         # API request/response types
 └── utils/
